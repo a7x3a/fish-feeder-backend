@@ -1,0 +1,20 @@
+{
+  "name": "fishfeeder-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "next": "^14.2.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.1"
+  }
+}
+
