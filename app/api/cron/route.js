@@ -1,6 +1,53 @@
 import { NextResponse } from 'next/server';
 import admin from 'firebase-admin';
 
+export const runtime = 'nodejs';
+
+/**
+ * Send a Telegram message using the bot API.
+ * Environment:
+ * - TELEGRAM_BOT_TOKEN
+ * - TELEGRAM_CHAT_ID
+ *
+ * This helper never throws – it only logs errors.
+ */
+async function sendTelegram(message) {
+  try {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+
+    if (!token || !chatId) {
+      console.warn(
+        '[CRON][TELEGRAM] Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID, skipping notification.'
+      );
+      return;
+    }
+
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: message,
+        parse_mode: 'HTML',
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '<unreadable body>');
+      console.error(
+        `[CRON][TELEGRAM] Failed to send message. Status: ${response.status} Body: ${body}`
+      );
+    }
+  } catch (error) {
+    console.error('[CRON][TELEGRAM] Error while sending message:', error);
+  }
+}
+
 /**
  * Lazily initialize and return the Firebase Realtime Database instance.
  * This only runs when the route is called (not during build).
@@ -180,6 +227,14 @@ async function handleReservationFeeds({
 
   await feederRef.child('status').set(1);
 
+  await sendTelegram(
+    [
+      '📅 Reservation Feed Executed',
+      `👤 User: ${reservation.user ?? 'unknown'}`,
+      `⏰ ${now.toISOString()}`,
+    ].join('\n')
+  );
+
   const reservationCreatedAt = fieldsToDate(
     reservation.createdAt || reservation.scheduledTime
   );
@@ -248,6 +303,18 @@ async function handleAutoFeed({
 
   const lastFeedStr = `${currentDateFields.year}-${currentDateFields.month}-${currentDateFields.day} ${currentDateFields.hour}:${currentDateFields.minute}:${currentDateFields.second}`;
   await feederRef.child('lastFeed').set(lastFeedStr);
+
+  const cooldownMinutes = Math.round(cooldownMs / 60000);
+  const delayMinutes = Math.round(autoFeedDelayMs / 60000);
+
+  await sendTelegram(
+    [
+      '🐟 Auto Feed Triggered',
+      `⏰ ${now.toISOString()}`,
+      `⏳ Interval: ${cooldownMinutes} min`,
+      `🕒 Extra Delay: ${delayMinutes} min`,
+    ].join('\n')
+  );
 
   return NextResponse.json({
     ok: true,
@@ -322,6 +389,16 @@ export async function GET(request) {
     const isDeviceOnline =
       deviceData?.wifi === 'connected' && deviceData?.uptime > 0;
 
+    if (!isDeviceOnline) {
+      await sendTelegram(
+        [
+          '⚠️ Device Offline',
+          `⏰ ${now.toISOString()}`,
+          'Feed actions skipped.',
+        ].join('\n')
+      );
+    }
+
     const currentStatus = feederData.status || 0;
     if (currentStatus === 1) {
       console.log('[CRON] Device is currently feeding - skipping');
@@ -349,6 +426,13 @@ export async function GET(request) {
     const fastingDay = feederData.fastingDay;
     if (isTodayFastingDay(fastingDay, now)) {
       console.log('[CRON] Fasting day - skipping all feeds');
+      await sendTelegram(
+        [
+          '🕋 Fasting Day',
+          `⏰ ${now.toISOString()}`,
+          'No feeds will be executed today.',
+        ].join('\n')
+      );
       return NextResponse.json({
         ok: true,
         type: 'none',
@@ -392,6 +476,14 @@ export async function GET(request) {
     });
   } catch (error) {
     console.error('[CRON] Error:', error);
+    const now = new Date();
+    await sendTelegram(
+      [
+        '❌ CRON ERROR',
+        `⏰ ${now.toISOString()}`,
+        error?.message ?? 'Unknown error',
+      ].join('\n')
+    );
     return NextResponse.json(
       {
         ok: false,
@@ -403,6 +495,4 @@ export async function GET(request) {
     );
   }
 }
-
-export const runtime = 'nodejs';
 
