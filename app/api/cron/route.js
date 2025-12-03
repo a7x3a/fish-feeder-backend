@@ -356,9 +356,17 @@ async function cleanupExpiredReservations({ now, feederRef, feederData }) {
  */
 export async function GET(request) {
   try {
+    const now = new Date();
     const cronSecret = process.env.CRON_SECRET;
 
     if (!isAuthorizedCronRequest(request, cronSecret)) {
+      await sendTelegram(
+        [
+          '⚠️ Unauthorized CRON Request',
+          `⏰ ${now.toISOString()}`,
+          'A request tried to call /api/cron without a valid secret or headers.',
+        ].join('\n')
+      );
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
@@ -369,6 +377,13 @@ export async function GET(request) {
       db = getDatabase();
     } catch (error) {
       console.error('[CRON] Firebase initialization failed:', error.message);
+      await sendTelegram(
+        [
+          '❌ CRON ERROR',
+          `⏰ ${now.toISOString()}`,
+          `Firebase initialization failed: ${error.message}`,
+        ].join('\n')
+      );
       return NextResponse.json(
         {
           ok: false,
@@ -379,10 +394,16 @@ export async function GET(request) {
       );
     }
 
-    const now = new Date();
     const { feederRef, feederData, deviceData } = await getFeederAndDevice(db);
 
     if (!feederData) {
+      await sendTelegram(
+        [
+          '⚠️ Cron Run – No Feeder Data',
+          `⏰ ${now.toISOString()}`,
+          'The path system/feeder does not exist or is empty.',
+        ].join('\n')
+      );
       return NextResponse.json({ ok: false, error: 'No feeder data found' });
     }
 
@@ -402,6 +423,13 @@ export async function GET(request) {
     const currentStatus = feederData.status || 0;
     if (currentStatus === 1) {
       console.log('[CRON] Device is currently feeding - skipping');
+      await sendTelegram(
+        [
+          'ℹ️ Cron Skipped – Already Feeding',
+          `⏰ ${now.toISOString()}`,
+          'The feeder status is already 1, so no new feed was started.',
+        ].join('\n')
+      );
       return NextResponse.json({
         ok: true,
         type: 'none',
@@ -468,6 +496,15 @@ export async function GET(request) {
 
     // Cleanup any expired reservations
     await cleanupExpiredReservations({ now, feederRef, feederData });
+
+    await sendTelegram(
+      [
+        'ℹ️ Cron Run – No Feed Needed',
+        `⏰ ${now.toISOString()}`,
+        `Device online: ${isDeviceOnline ? 'yes' : 'no'}`,
+        'Result: No reservation or auto feed was executed.',
+      ].join('\n')
+    );
 
     return NextResponse.json({
       ok: true,
