@@ -8,12 +8,6 @@
     "app/api/**/*.js": {
       "maxDuration": 10
     }
-  },
-  "crons": [
-    {
-      "path": "/api/cron",
-      "schedule": "*/1 * * * *"
-    }
-  ]
+  }
 }
 
