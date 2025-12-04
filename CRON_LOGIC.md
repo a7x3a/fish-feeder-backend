@@ -1,293 +1,448 @@
-# 🐟 FishFeeder Cron Backend – Simple Logic Overview
+# 🐟 FishFeeder NEXT API – Full Backend Specification  
+This document defines the complete backend logic for the FishFeeder system, including:
 
-This document explains, in simple language, how the `/api/cron` backend route works and how it controls the fish feeder.
+- Cloud scheduling  
+- Feed priority logic  
+- Reservations  
+- Auto-feed  
+- Offline mode handling  
+- Device monitoring  
+- Telegram messaging  
+- Telegram commands (/status, /history, /reservations, /help)  
+- Alerts (offline, sensor abnormal, feed executed)  
+
+This is the final master file for backend implementation.
 
 ---
 
-## 1. What calls `/api/cron`?
+# 1. OVERVIEW
 
-The cron route is **not** called by users directly.  
-It is called automatically by:
+Your Next.js API will:
 
-- **FastCron** (or any external cron service) using:
-  - `GET https://your-project.vercel.app/api/cron?secret=CRON_SECRET`
-- **Vercel Scheduler** (optional) using:
-  - `GET /api/cron` with header `x-vercel-cron: 1`
+✔️ Handle all feeding logic when device is online  
+✔️ Trigger feeds based on priorities  
+✔️ Manage reservations (FIFO queue)  
+✔️ Execute auto-feed after grace period  
+✔️ Detect offline device state  
+✔️ Send Telegram alerts & status updates  
+✔️ Process Telegram bot commands  
+✔️ Periodically run a scheduler (cron job every 1 minute)
 
-You can also test it manually in a browser or with curl by calling:
+ESP8266 handles offline feeding automatically — backend handles everything online.
 
-```text
-https://your-project.vercel.app/api/cron?secret=CRON_SECRET
+---
+
+# 2. FIREBASE STRUCTURE
+
+```
+system/
+  feeder/
+    status: 0 | 1
+    lastFeedTime: number
+    lastFeed: string
+    timer:
+      hour: number
+      minute: number
+      noFeedDay: number | null
+    delays:
+      reservationDelayMinutes: number
+      autoFeedDelayMinutes: number
+    reservations: [ ... ]
+    history: [ ... ]
+
+  device/
+    wifi: "connected" | "disconnected"
+    uptime: number
+    servo: "on" | "off"
+
+  sensors/
+    tds: number
+    temperature: number
+
+  alerts/
+    lastOfflineAlert: timestamp
+    lastOnlineAlert: timestamp
+    lastTdsAlert: timestamp
+    lastTempAlert: timestamp
 ```
 
 ---
 
-## 2. Security – who is allowed to run cron?
+# 3. FEED PRIORITY SYSTEM (ONLINE MODE)
 
-At the very start, the backend checks if the request is allowed:
+Your backend must enforce feed priority:
 
-- It reads `CRON_SECRET` from environment variables.
-- In **production**, the request is allowed only if:
-  - Header `x-vercel-cron: 1` is present, **or**
-  - Header `Authorization: Bearer CRON_SECRET` is present, **or**
-  - Query string contains `?secret=CRON_SECRET`
-- In **development** (or when `CRON_SECRET` is not set), the check is skipped.
+### **Priority 1 — Manual Feed**
+Triggered by frontend:
+```
+/system/feeder/status = 1
+```
+Backend must NOT override it.
 
-If the check fails, it returns:
+---
 
-```json
-{ "error": "Unauthorized" }
+### **Priority 2 — Reservation Feed**
+Run when scheduled time is reached:
+
+Flow:
+1. Find earliest reservation (`createdAt ASC`)
+2. If scheduledTime ≤ now  
+3. If cooldown finished  
+4. Trigger feed  
+5. Remove reservation  
+6. Log into history  
+7. Send Telegram message  
+
+---
+
+### **Priority 3 — Auto Feed**
+Used only when:
+- No manual feed  
+- No reservation due  
+- Cooldown finished  
+- Grace period passed  
+
+```
+nextFeed = lastFeedTime + interval
+graceEnd = nextFeed + autoFeedDelay * 60000
+if now >= graceEnd => auto-feed
 ```
 
 ---
 
-## 3. Connecting to Firebase
+# 4. BACKEND SCHEDULER ENDPOINT
 
-If the request is authorized, the backend:
+Your cron job calls:
 
-1. Reads the Firebase service account from `FIREBASE_SERVICE_ACCOUNT` (JSON string).
-2. Reads the database URL from `FIREBASE_DB_URL`.
-3. Initializes the Firebase Admin SDK **only once** (lazy init).
-4. Gets access to the Realtime Database.
+```
+GET /api/scheduler/run
+```
 
-If this fails, it returns:
+Runs every **1 minute**.
 
-```json
-{
-  "ok": false,
-  "error": "Firebase initialization failed"
+---
+
+## 4.1 Scheduler Steps (MUST FOLLOW ORDER)
+
+### **Step 1 — Load all data**
+Fetch:
+- lastFeedTime  
+- timerHour, timerMinute  
+- delays  
+- reservations[]  
+- wifi status  
+- sensor values  
+
+---
+
+### **Step 2 — Handle Device Offline**
+If `wifi !== "connected"`:
+
+Do NOT attempt feeding.
+
+But DO:
+- Detect offline transitions  
+- Send offline alert  
+- Track offline duration  
+- Clean expired reservations  
+
+Offline logic is done by ESP, not backend.
+
+---
+
+### **Step 3 — Check Reservation Queue (FIFO)**
+Find earliest reservation with:
+```
+scheduledTime <= now
+```
+
+If exists:
+```
+triggerFeed("reservation", user)
+```
+Send Telegram feed summary.
+
+---
+
+### **Step 4 — Manual Feeds**
+If `/status == 1`, backend does nothing.
+
+---
+
+### **Step 5 — Auto Feed**
+If cooldown & grace conditions met:
+```
+triggerFeed("auto", "System")
+```
+Send Telegram notification.
+
+---
+
+### **Step 6 — Sensor Alerts**
+If sensors exceed limits, send Telegram alerts:
+- TDS > 800 ppm  
+- Temperature < 20°C or > 30°C
+
+Throttle using `/system/alerts/last*` timestamps.
+
+---
+
+### **Step 7 — Update Scheduled Feed Time**
+Backend should correct drift and keep scheduled values consistent.
+
+---
+
+# 5. INTERNAL FUNCTION: triggerFeed()
+
+```
+async function triggerFeed(type, user) {
+  set status = 1
+
+  wait 3–5 seconds
+
+  update:
+    lastFeedTime = now
+    lastFeed = ISO timestamp
+
+  append history entry:
+    { type, user, timestamp }
+
+  sendTelegramFeed(type, user)
+
+  cleanup reservation if needed
+
+  return { ok: true }
 }
 ```
 
 ---
 
-## 4. Reading current system state
+# 6. TELEGRAM MESSAGING SYSTEM
 
-After Firebase is ready, the backend:
+Backend must notify Telegram about EVERY important event.
 
-1. Sets `now = new Date()` (current time).
-2. Reads two paths from the database:
-   - `system/feeder` → main feeder settings & state.
-   - `system/device` → device connection info (WiFi, uptime).
+Telegram bot token + chat ID stored in env variables:
 
-If `system/feeder` does not exist, it returns:
-
-```json
-{ "ok": false, "error": "No feeder data found" }
+```
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
 ---
 
-## 5. Check if device is online
+## 6.1 Event: Feed Executed
 
-The device is considered **online** only if:
+Send message:
 
-- `deviceData.wifi === "connected"` **and**
-- `deviceData.uptime > 0`
+```
+🐟 FEED EXECUTED
+Type: <manual | reservation | auto | offline>
+User: <user>
+Time: <local formatted>
 
-If the device is **offline**:
-
-- A Telegram message is sent:
-
-  ```text
-  ⚠️ Device Offline
-  ⏰ {now}
-  Feed actions skipped.
-  ```
-
-- The backend continues, but **will not trigger feeds** when `isDeviceOnline` is false.
-
----
-
-## 6. Check if device is already feeding
-
-The feeder status is stored at `system/feeder/status`.
-
-- If `status === 1`, the device is already feeding.
-- In that case, the backend:
-  - Logs a message.
-  - Returns:
-
-    ```json
-    { "ok": true, "type": "none", "reason": "already_feeding" }
-    ```
-
-No new feed is started while one is in progress.
-
----
-
-## 7. Time settings and fasting day
-
-From `system/feeder`, the backend reads:
-
-- `lastFeedTime` → when the last feed finished.
-- `timerHours` and `timerMinutes` → how often auto feed should repeat.
-- `delays.autoFeedDelayMinutes` → extra delay after the normal interval.
-- `fastingDay` → day of week (0–6) when no feeds should run.
-
-It converts `lastFeedTime` into a JavaScript `Date` and calculates:
-
-- **Cooldown** (interval between feeds):
-  - `cooldownMs = timerHours * 3600000 + timerMinutes * 60000`
-- **Extra delay**:
-  - `autoFeedDelayMs = autoFeedDelayMinutes * 60000`
-
-### Fasting day
-
-If `fastingDay` equals `now.getDay()`:
-
-- Logs that it is a fasting day.
-- Sends Telegram:
-
-  ```text
-  🕋 Fasting Day
-  ⏰ {now}
-  No feeds will be executed today.
-  ```
-
-- Returns:
-
-  ```json
-  { "ok": true, "type": "none", "reason": "fasting_day" }
-  ```
-
-No feeds (manual reservations or auto) will be started on a fasting day.
-
----
-
-## 8. Priority 2 – Reservation feeds
-
-If it is **not** a fasting day and the device is **online**, the backend checks **reservations**:
-
-1. Reads `system/feeder/reservations` (array).
-2. Keeps only entries that have a `scheduledTime`.
-3. Converts each `scheduledTime` to a `Date`.
-4. Selects all reservations where `scheduledTime <= now` (ready to run).
-5. Sorts them by `createdAt` (or `scheduledTime`) so the oldest is executed first (FIFO).
-
-If there is at least one **ready** reservation and the device is online:
-
-1. Picks the first reservation.
-2. Sets `system/feeder/status = 1` (tells the device to feed).
-3. Removes that reservation from the list.
-4. Cleans up any old reservations that are in the past.
-5. Sends Telegram:
-
-   ```text
-   📅 Reservation Feed Executed
-   👤 User: {reservation.user}
-   ⏰ {now}
-   ```
-
-6. Returns:
-
-   ```json
-   {
-     "ok": true,
-     "type": "reservation",
-     "user": "...",
-     "scheduledTime": "..."
-   }
-   ```
-
-If no reservation is ready, the backend moves on to **auto feed**.
-
----
-
-## 9. Priority 3 – Auto feed
-
-If there is **no reservation feed** to run, the backend checks auto feed:
-
-1. Makes sure:
-   - `lastFeedTime` is valid,
-   - `cooldownMs > 0`,
-   - device is **online**.
-2. Calculates:
-
-   - `nextFeedTime = lastFeedTime + cooldownMs`
-   - `realAutoFeedTime = nextFeedTime + autoFeedDelayMs`
-
-3. If `now` is **before** `realAutoFeedTime`, it is **too early**, so no auto feed.
-4. If `now` is **after or equal** to `realAutoFeedTime`:
-
-   - Logs that auto feed is executing.
-   - Sets `system/feeder/status = 1`.
-   - Updates:
-     - `system/feeder/lastFeedTime` with the current time (separate fields).
-     - `system/feeder/lastFeed` with a formatted date string.
-   - Sends Telegram:
-
-     ```text
-     🐟 Auto Feed Triggered
-     ⏰ {now}
-     ⏳ Interval: {cooldownMinutes} min
-     🕒 Extra Delay: {delayMinutes} min
-     ```
-
-   - Returns:
-
-     ```json
-     { "ok": true, "type": "auto", "lastFeedTime": { ... } }
-     ```
-
-The physical device (ESP8266) will see `status = 1` and perform the actual motor/feeding.
-
----
-
-## 10. Cleaning old reservations
-
-If no reservation or auto feed is executed, the backend still:
-
-1. Looks at all reservations.
-2. Removes any that have `scheduledTime` in the past.
-3. Saves the cleaned list back to `system/feeder/reservations`.
-
-Then it returns:
-
-```json
-{ "ok": true, "type": "none", "reason": "no_feed_needed" }
+Last Feed: <time>
+Next Feed: <time>
+Cooldown: <hours:minutes>
 ```
 
 ---
 
-## 11. Error handling & Telegram alerts
+## 6.2 Event: Device Offline
 
-If any unexpected error happens in the cron handler:
+Send message if wifi becomes disconnected:
 
-- It logs the error on the server.
-- It sends a Telegram message:
+```
+❌ DEVICE OFFLINE
+The feeder lost internet connection.
 
-  ```text
-  ❌ CRON ERROR
-  ⏰ {now}
-  {error.message}
-  ```
+Last Feed: <time>
+Uptime: <seconds>
+```
 
-- It returns:
+Throttle: only once every 15 minutes.
 
-```json
-{ "ok": false, "error": "..." }
+---
+
+## 6.3 Event: Device Online
+
+When device reconnects:
+
+```
+🟢 DEVICE ONLINE
+Connection restored.
+
+Last Sync: <time>
 ```
 
 ---
 
-## 12. Summary – who does what?
+## 6.4 Sensor Alerts
 
-- **Cron service (FastCron / Vercel):** calls `/api/cron` every minute (or other schedule).
-- **Backend (`/api/cron`):**
-  - Checks authorization.
-  - Reads current state from Firebase.
-  - Decides:
-    - Reservation feed?
-    - Auto feed?
-    - Or nothing?
-  - Updates `system/feeder` in Firebase.
-  - Sends Telegram notifications for important events and errors.
-- **Device (ESP8266):**
-  - Watches Firebase (e.g., `status` field).
-  - When it sees `status = 1`, it physically rotates the motor and feeds the fish.
-  - Afterwards, it updates its own data (like uptime, WiFi status, history, etc.).
+### High TDS (>800 ppm)
+```
+⚠️ WATER WARNING
+TDS is high: <value> ppm
+Normal: 200–600 ppm
+```
 
-Together, they create a 24/7 automatic feeding system with clear monitoring via Telegram.
+### Abnormal Temperature (<20 or >30)
+```
+⚠️ TEMPERATURE WARNING
+Current: <temp>°C
+Safe Range: 20–30°C
+```
 
+Throttle: once per 30 minutes.
 
+---
+
+# 7. TELEGRAM BOT COMMANDS
+
+Your API must handle Telegram webhook:
+
+```
+POST /api/telegram/webhook
+```
+
+Parse incoming JSON:
+
+```
+message.text
+message.chat.id
+```
+
+Process the following commands:
+
+---
+
+## 7.1 `/status`
+
+Returns:
+
+```
+📊 SYSTEM STATUS
+
+Device: <online/offline>
+WiFi: <connected/disconnected>
+Servo: <on/off>
+Uptime: <seconds>
+
+Last Feed: <time>
+Next Feed: <time>
+Cooldown: <H:M>
+
+Temperature: <value>°C
+TDS: <value> ppm
+
+Reservations: <count>
+```
+
+---
+
+## 7.2 `/history`
+
+Return last 5 feed entries:
+
+```
+📜 LAST 5 FEEDS
+1. [manual] Ahmad – 14:30
+2. [reservation] visitor – 12:00
+3. [offline] System – 10:00
+4. [auto] System – 08:00
+5. [manual] Ahmad – yesterday
+```
+
+---
+
+## 7.3 `/reservations`
+
+```
+📌 ACTIVE RESERVATIONS
+1. john_doe – 15:45
+2. visitor – 16:00
+```
+
+If none:
+```
+No active reservations.
+```
+
+---
+
+## 7.4 `/help`
+
+```
+FishFeeder Bot Commands:
+/status – Show full system status
+/history – Last 5 feed events
+/reservations – Active reservation queue
+/help – Available commands
+```
+
+---
+
+# 8. TELEGRAM SERVICE MODULE
+
+Create `services/telegram.js`:
+
+```
+export async function sendMessage(text) {
+  await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: CHAT_ID,
+      text,
+      parse_mode: "HTML"
+    })
+  });
+}
+```
+
+This function must NEVER block feed logic if Telegram API fails.
+
+---
+
+# 9. SECURITY RULES
+
+- Validate incoming data on all endpoints  
+- Prevent manual feed spam  
+- Prevent reservation duplicates  
+- Prevent feed triggering twice in cooldown window  
+- All scheduler actions MUST be idempotent  
+
+---
+
+# 10. ENDPOINT SUMMARY
+
+| Endpoint | Purpose |
+|---------|---------|
+| GET `/api/scheduler/run` | Main scheduler brain |
+| POST `/api/feed/manual` | Trigger manual feed |
+| POST `/api/reservations/create` | Add a reservation |
+| POST `/api/reservations/cancel` | Cancel reservation |
+| GET `/api/device/status` | Device state |
+| POST `/api/telegram/webhook` | Bot command handler |
+| POST `/api/alerts/telegram` | Send custom alert |
+
+---
+
+# 11. BACKEND GUARANTEES
+
+This system must ensure:
+
+✔️ No double-feeds  
+✔️ Reservations always FIFO  
+✔️ Offline feeding NEVER breaks online logic  
+✔️ Telegram messages are accurate  
+✔️ No duplicate alerts  
+✔️ Feeds, alerts, scheduler always stable  
+✔️ ESP and cloud remain in sync  
+✔️ Perfect safety for fish  
+
+---
+
+# END OF DOCUMENT
+This is the complete specification for your FishFeeder NEXT API backend.
+
+Your code agent must follow this EXACT document.

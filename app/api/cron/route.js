@@ -1,7 +1,19 @@
 import { NextResponse } from 'next/server';
-import admin from 'firebase-admin';
 
 export const runtime = 'nodejs';
+
+/**
+ * Legacy cron endpoint - redirects to new scheduler endpoint.
+ * For backward compatibility with existing FastCron configurations.
+ */
+export async function GET(request) {
+  // Redirect to new scheduler endpoint
+  const url = new URL(request.url);
+  url.pathname = '/api/scheduler/run';
+  
+  // Forward all query params and headers
+  return NextResponse.redirect(url, { status: 307 });
+}
 
 /**
  * Send a Telegram message using the bot API with message limit management.
