@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import admin from 'firebase-admin';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 /**
  * Lazily initialize and return the Firebase Realtime Database instance.
