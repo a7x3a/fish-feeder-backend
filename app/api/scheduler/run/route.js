@@ -383,8 +383,25 @@ export async function GET(request) {
     let db;
     try {
       db = getDatabase();
+      // Send monitoring message - scheduler started
+      await sendTelegram(
+        [
+          '🔄 <b>Scheduler Run Started</b>',
+          `⏰ ${formatDate(now)}`,
+          'Checking for feeds and system status...',
+        ].join('\n'),
+        db
+      );
     } catch (error) {
       console.error('[SCHEDULER] Firebase initialization failed:', error.message);
+      await sendTelegram(
+        [
+          '❌ <b>SCHEDULER ERROR</b>',
+          `⏰ ${formatDate(now)}`,
+          `Firebase initialization failed: ${error.message}`,
+        ].join('\n'),
+        null
+      );
       return NextResponse.json(
         { ok: false, error: 'Firebase initialization failed', message: error.message },
         { status: 500 }
@@ -410,6 +427,14 @@ export async function GET(request) {
     const alerts = alertsSnapshot.val() || {};
 
     if (!feederData) {
+      await sendTelegram(
+        [
+          '⚠️ <b>No Feeder Data</b>',
+          `⏰ ${formatDate(now)}`,
+          'The system/feeder path does not exist or is empty.',
+        ].join('\n'),
+        db
+      );
       return NextResponse.json({ ok: false, error: 'No feeder data found' });
     }
 
@@ -430,6 +455,17 @@ export async function GET(request) {
 
     // If device is offline, skip feeding but continue with cleanup
     if (!isOnline) {
+      await sendTelegram(
+        [
+          '⚠️ <b>Device Offline</b>',
+          `⏰ ${formatDate(now)}`,
+          'Feed actions skipped. Device is not connected.',
+          `WiFi: ${deviceData?.wifi || 'unknown'}`,
+          `Uptime: ${deviceData?.uptime || 0} seconds`,
+        ].join('\n'),
+        db
+      );
+
       // Clean expired reservations even when offline
       const reservations = feederData.reservations || [];
       const validReservations = reservations.filter((r) => r && r.scheduledTime);
@@ -453,6 +489,14 @@ export async function GET(request) {
     const currentStatus = feederData.status || 0;
     if (currentStatus === 1) {
       console.log('[SCHEDULER] Device is currently feeding - skipping');
+      await sendTelegram(
+        [
+          'ℹ️ <b>Already Feeding</b>',
+          `⏰ ${formatDate(now)}`,
+          'Device is currently feeding. Skipping this run.',
+        ].join('\n'),
+        db
+      );
       return NextResponse.json({
         ok: true,
         type: 'none',
@@ -474,6 +518,14 @@ export async function GET(request) {
     // Check fasting day
     if (fastingDay !== null && fastingDay !== undefined && now.getDay() === fastingDay) {
       console.log('[SCHEDULER] Fasting day - skipping all feeds');
+      await sendTelegram(
+        [
+          '🕋 <b>Fasting Day</b>',
+          `⏰ ${formatDate(now)}`,
+          'No feeds will be executed today (fasting day configured).',
+        ].join('\n'),
+        db
+      );
       return NextResponse.json({
         ok: true,
         type: 'none',
@@ -595,10 +647,30 @@ export async function GET(request) {
 
     if (cleanedReservations.length !== validReservations.length) {
       await feederRef.child('reservations').set(cleanedReservations);
-      console.log(
-        `[SCHEDULER] Cleaned ${validReservations.length - cleanedReservations.length} expired reservations`
+      const cleanedCount = validReservations.length - cleanedReservations.length;
+      console.log(`[SCHEDULER] Cleaned ${cleanedCount} expired reservations`);
+      await sendTelegram(
+        [
+          '🧹 <b>Reservations Cleaned</b>',
+          `⏰ ${formatDate(now)}`,
+          `Removed <code>${cleanedCount}</code> expired reservation(s).`,
+        ].join('\n'),
+        db
       );
     }
+
+    // Send summary if no feed was needed
+    await sendTelegram(
+      [
+        'ℹ️ <b>No Feed Needed</b>',
+        `⏰ ${formatDate(now)}`,
+        `Device: ${isOnline ? '✅ Online' : '❌ Offline'}`,
+        `Reservations: ${validReservations.length} active`,
+        `Last Feed: ${formatDate(lastFeedTime)}`,
+        `Status: All checks completed, no feed required.`,
+      ].join('\n'),
+      db
+    );
 
     return NextResponse.json({
       ok: true,
@@ -607,6 +679,16 @@ export async function GET(request) {
     });
   } catch (error) {
     console.error('[SCHEDULER] Error:', error);
+    const now = new Date();
+    await sendTelegram(
+      [
+        '❌ <b>SCHEDULER ERROR</b>',
+        `⏰ ${formatDate(now)}`,
+        `Error: ${error?.message || 'Unknown error'}`,
+        `Stack: ${error?.stack ? error.stack.substring(0, 200) : 'N/A'}`,
+      ].join('\n'),
+      null
+    );
     return NextResponse.json(
       {
         ok: false,
