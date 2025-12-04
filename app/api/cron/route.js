@@ -4,14 +4,15 @@ import admin from 'firebase-admin';
 export const runtime = 'nodejs';
 
 /**
- * Send a Telegram message using the bot API.
+ * Send a Telegram message using the bot API with message limit management.
  * Environment:
  * - TELEGRAM_BOT_TOKEN
  * - TELEGRAM_CHAT_ID
  *
+ * Stores message IDs in Firebase and deletes all messages after 10 messages.
  * This helper never throws – it only logs errors.
  */
-async function sendTelegram(message) {
+async function sendTelegram(message, db) {
   try {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -42,9 +43,123 @@ async function sendTelegram(message) {
       console.error(
         `[CRON][TELEGRAM] Failed to send message. Status: ${response.status} Body: ${body}`
       );
+      return;
+    }
+
+    const result = await response.json();
+    if (!result.ok || !result.result?.message_id) {
+      console.error('[CRON][TELEGRAM] Failed to get message ID from response');
+      return;
+    }
+
+    const messageId = result.result.message_id;
+
+    // Store message ID in Firebase
+    if (db) {
+      try {
+        const telegramRef = db.ref('system/telegram');
+        const snapshot = await telegramRef.once('value');
+        const telegramData = snapshot.val() || {};
+        const messageIds = telegramData.messageIds || [];
+        const count = telegramData.count || 0;
+
+        // Add new message ID
+        const updatedMessageIds = [...messageIds, messageId];
+        const newCount = count + 1;
+
+        // If we've reached 10 messages, delete all and reset
+        if (newCount >= 10) {
+          await deleteAllTelegramMessages(token, chatId, updatedMessageIds);
+          await telegramRef.set({
+            messageIds: [],
+            count: 0,
+          });
+          console.log('[CRON][TELEGRAM] Reached 10 messages, cleared all messages');
+        } else {
+          // Update with new message ID and count
+          await telegramRef.set({
+            messageIds: updatedMessageIds,
+            count: newCount,
+          });
+        }
+      } catch (firebaseError) {
+        console.error('[CRON][TELEGRAM] Error managing message IDs in Firebase:', firebaseError);
+      }
     }
   } catch (error) {
     console.error('[CRON][TELEGRAM] Error while sending message:', error);
+  }
+}
+
+/**
+ * Delete all Telegram messages by their message IDs.
+ */
+async function deleteAllTelegramMessages(token, chatId, messageIds) {
+  if (!messageIds || messageIds.length === 0) return;
+
+  const deletePromises = messageIds.map(async (messageId) => {
+    try {
+      const url = `https://api.telegram.org/bot${token}/deleteMessage`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '<unreadable body>');
+        console.warn(
+          `[CRON][TELEGRAM] Failed to delete message ${messageId}. Status: ${response.status} Body: ${body}`
+        );
+      }
+    } catch (error) {
+      console.warn(`[CRON][TELEGRAM] Error deleting message ${messageId}:`, error);
+    }
+  });
+
+  await Promise.all(deletePromises);
+}
+
+/**
+ * Clear all Telegram messages (used by /clear command).
+ */
+async function clearAllTelegramMessages(db) {
+  try {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+
+    if (!token || !chatId) {
+      return { success: false, error: 'Missing Telegram credentials' };
+    }
+
+    if (!db) {
+      return { success: false, error: 'Database not available' };
+    }
+
+    const telegramRef = db.ref('system/telegram');
+    const snapshot = await telegramRef.once('value');
+    const telegramData = snapshot.val() || {};
+    const messageIds = telegramData.messageIds || [];
+
+    if (messageIds.length === 0) {
+      return { success: true, deleted: 0 };
+    }
+
+    await deleteAllTelegramMessages(token, chatId, messageIds);
+    await telegramRef.set({
+      messageIds: [],
+      count: 0,
+    });
+
+    return { success: true, deleted: messageIds.length };
+  } catch (error) {
+    console.error('[CRON][TELEGRAM] Error clearing messages:', error);
+    return { success: false, error: error.message };
   }
 }
 
@@ -196,6 +311,7 @@ async function handleReservationFeeds({
   feederRef,
   feederData,
   isDeviceOnline,
+  db,
 }) {
   const reservations = feederData.reservations || [];
   const validReservations = reservations.filter(
@@ -229,10 +345,13 @@ async function handleReservationFeeds({
 
   await sendTelegram(
     [
-      '📅 Reservation Feed Executed',
-      `👤 User: ${reservation.user ?? 'unknown'}`,
-      `⏰ ${now.toISOString()}`,
-    ].join('\n')
+      '📅 <b>Reservation Feed Executed</b>',
+      `👤 User: <code>${reservation.user ?? 'unknown'}</code>`,
+      `⏰ Time: <code>${now.toISOString()}</code>`,
+      `📊 Status: <b>Feed Triggered</b>`,
+      `🔗 Device: <b>Online & Ready</b>`,
+    ].join('\n'),
+    db
   );
 
   const reservationCreatedAt = fieldsToDate(
@@ -279,6 +398,7 @@ async function handleAutoFeed({
   cooldownMs,
   autoFeedDelayMs,
   isDeviceOnline,
+  db,
 }) {
   if (!lastFeedTime || Number.isNaN(lastFeedTime.getTime()) || cooldownMs <= 0) {
     return null;
@@ -309,11 +429,14 @@ async function handleAutoFeed({
 
   await sendTelegram(
     [
-      '🐟 Auto Feed Triggered',
-      `⏰ ${now.toISOString()}`,
-      `⏳ Interval: ${cooldownMinutes} min`,
-      `🕒 Extra Delay: ${delayMinutes} min`,
-    ].join('\n')
+      '🐟 <b>Auto Feed Triggered</b>',
+      `⏰ Time: <code>${now.toISOString()}</code>`,
+      `⏳ Interval: <code>${cooldownMinutes} min</code>`,
+      `🕒 Extra Delay: <code>${delayMinutes} min</code>`,
+      `📊 Status: <b>Feed Triggered</b>`,
+      `🔗 Device: <b>Online & Ready</b>`,
+    ].join('\n'),
+    db
   );
 
   return NextResponse.json({
@@ -360,13 +483,6 @@ export async function GET(request) {
     const cronSecret = process.env.CRON_SECRET;
 
     if (!isAuthorizedCronRequest(request, cronSecret)) {
-      await sendTelegram(
-        [
-          '⚠️ Unauthorized CRON Request',
-          `⏰ ${now.toISOString()}`,
-          'A request tried to call /api/cron without a valid secret or headers.',
-        ].join('\n')
-      );
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
@@ -377,13 +493,6 @@ export async function GET(request) {
       db = getDatabase();
     } catch (error) {
       console.error('[CRON] Firebase initialization failed:', error.message);
-      await sendTelegram(
-        [
-          '❌ CRON ERROR',
-          `⏰ ${now.toISOString()}`,
-          `Firebase initialization failed: ${error.message}`,
-        ].join('\n')
-      );
       return NextResponse.json(
         {
           ok: false,
@@ -397,39 +506,15 @@ export async function GET(request) {
     const { feederRef, feederData, deviceData } = await getFeederAndDevice(db);
 
     if (!feederData) {
-      await sendTelegram(
-        [
-          '⚠️ Cron Run – No Feeder Data',
-          `⏰ ${now.toISOString()}`,
-          'The path system/feeder does not exist or is empty.',
-        ].join('\n')
-      );
       return NextResponse.json({ ok: false, error: 'No feeder data found' });
     }
 
     const isDeviceOnline =
       deviceData?.wifi === 'connected' && deviceData?.uptime > 0;
 
-    if (!isDeviceOnline) {
-      await sendTelegram(
-        [
-          '⚠️ Device Offline',
-          `⏰ ${now.toISOString()}`,
-          'Feed actions skipped.',
-        ].join('\n')
-      );
-    }
-
     const currentStatus = feederData.status || 0;
     if (currentStatus === 1) {
       console.log('[CRON] Device is currently feeding - skipping');
-      await sendTelegram(
-        [
-          'ℹ️ Cron Skipped – Already Feeding',
-          `⏰ ${now.toISOString()}`,
-          'The feeder status is already 1, so no new feed was started.',
-        ].join('\n')
-      );
       return NextResponse.json({
         ok: true,
         type: 'none',
@@ -454,13 +539,6 @@ export async function GET(request) {
     const fastingDay = feederData.fastingDay;
     if (isTodayFastingDay(fastingDay, now)) {
       console.log('[CRON] Fasting day - skipping all feeds');
-      await sendTelegram(
-        [
-          '🕋 Fasting Day',
-          `⏰ ${now.toISOString()}`,
-          'No feeds will be executed today.',
-        ].join('\n')
-      );
       return NextResponse.json({
         ok: true,
         type: 'none',
@@ -468,19 +546,20 @@ export async function GET(request) {
       });
     }
 
-    // PRIORITY 2: Reservation feeds
+    // PRIORITY 2: Reservation feeds (only if device is online)
     const reservationResult = await handleReservationFeeds({
       now,
       feederRef,
       feederData,
       isDeviceOnline,
+      db,
     });
 
     if (reservationResult.handled) {
       return reservationResult.response;
     }
 
-    // PRIORITY 3: Auto feed
+    // PRIORITY 3: Auto feed (only if device is online)
     const autoFeedResponse = await handleAutoFeed({
       now,
       feederRef,
@@ -488,6 +567,7 @@ export async function GET(request) {
       cooldownMs,
       autoFeedDelayMs,
       isDeviceOnline,
+      db,
     });
 
     if (autoFeedResponse) {
@@ -497,15 +577,6 @@ export async function GET(request) {
     // Cleanup any expired reservations
     await cleanupExpiredReservations({ now, feederRef, feederData });
 
-    await sendTelegram(
-      [
-        'ℹ️ Cron Run – No Feed Needed',
-        `⏰ ${now.toISOString()}`,
-        `Device online: ${isDeviceOnline ? 'yes' : 'no'}`,
-        'Result: No reservation or auto feed was executed.',
-      ].join('\n')
-    );
-
     return NextResponse.json({
       ok: true,
       type: 'none',
@@ -513,14 +584,6 @@ export async function GET(request) {
     });
   } catch (error) {
     console.error('[CRON] Error:', error);
-    const now = new Date();
-    await sendTelegram(
-      [
-        '❌ CRON ERROR',
-        `⏰ ${now.toISOString()}`,
-        error?.message ?? 'Unknown error',
-      ].join('\n')
-    );
     return NextResponse.json(
       {
         ok: false,
