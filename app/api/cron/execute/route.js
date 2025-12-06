@@ -91,14 +91,14 @@ async function executeCron(request) {
           feederRef.once('value'),
           deviceRef.once('value'),
         ]),
-        2500 // 2.5 second timeout for reads
+        4000 // 4 second timeout for reads (more realistic)
       );
 
       feederData = feederSnapshot.val() || {};
       deviceData = deviceSnapshot.val() || {};
     } catch (error) {
       if (error.message === 'firebase_timeout') {
-        console.log('[CRON] firebase_timeout');
+        console.log('[CRON] firebase_timeout on read');
         return NextResponse.json({
           error: 'firebase_timeout',
           type: 'none'
@@ -201,7 +201,7 @@ async function executeCron(request) {
             feederRef,
             now,
           }),
-          2000 // 2 second timeout for feed trigger
+          5000 // 5 second timeout for feed trigger (3 writes needed)
         );
         timestampMs = result.timestampMs;
       } catch (error) {
@@ -238,20 +238,18 @@ async function executeCron(request) {
         currentScheduledTime = scheduledTime + cooldownMs;
       }
 
-      // Update reservations with timeout
-      try {
-        await withTimeout(
-          feederRef.child('reservations').set(recalculatedReservations),
-          2000
-        );
-      } catch (error) {
+      // Update reservations with timeout (non-critical - can fail)
+      withTimeout(
+        feederRef.child('reservations').set(recalculatedReservations),
+        3000
+      ).catch(error => {
         if (error.message === 'firebase_timeout') {
-          console.log('[CRON] firebase_timeout on reservations update');
-          // Continue anyway - feed was triggered
+          console.log('[CRON] firebase_timeout on reservations update (non-critical)');
         } else {
-          throw error;
+          console.error('[CRON] Error updating reservations:', error);
         }
-      }
+        // Continue anyway - feed was triggered successfully
+      });
 
       // Send Telegram notification (non-blocking)
       sendReservationExecutedMessage({
@@ -297,7 +295,7 @@ async function executeCron(request) {
               feederRef,
               now,
             }),
-            2000
+            5000 // 5 second timeout for feed trigger (3 writes needed)
           );
         } catch (error) {
           if (error.message === 'firebase_timeout') {
