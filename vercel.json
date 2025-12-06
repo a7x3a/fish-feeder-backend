@@ -8,19 +8,5 @@
     "app/api/**/*.js": {
       "maxDuration": 10
     }
-  },
-  "crons": [
-    {
-      "path": "/api/cron/execute-reservations",
-      "schedule": "*/30 * * * * *"
-    },
-    {
-      "path": "/api/cron/auto-feed",
-      "schedule": "* * * * *"
-    },
-    {
-      "path": "/api/cron/check-device",
-      "schedule": "*/5 * * * *"
-    }
-  ]
+  }
 }
