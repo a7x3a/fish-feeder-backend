@@ -7,6 +7,18 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Firebase timeout wrapper
+ */
+async function withTimeout(promise, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('firebase_timeout')), ms)
+    )
+  ]);
+}
+
+/**
  * Manual Feed Endpoint
  * POST /api/feed/manual
  * 
@@ -16,92 +28,109 @@ export async function POST(request) {
   const corsResponse = handleCORS(request);
   if (corsResponse) return corsResponse;
 
-  const now = new Date();
+  const startTime = Date.now();
   let db = null;
 
   try {
-    // Get request body
-    const body = await request.json().catch(() => ({}));
-    const user = body.user || 'Visitor';
-    const userEmail = body.userEmail || null;
-    const deviceId = body.deviceId || null;
+    // Get request body with error handling
+    let body;
+    try {
+      body = await request.json();
+    } catch (error) {
+      return addCorsHeaders(NextResponse.json({
+        success: false,
+        error: 'INVALID_REQUEST',
+        message: 'Invalid JSON in request body',
+      }, { status: 400 }));
+    }
+
+    const user = (body.user || 'Visitor').toString().substring(0, 100); // Limit length
+    const userEmail = body.userEmail ? body.userEmail.toString().substring(0, 200) : null;
+    const deviceId = body.deviceId ? body.deviceId.toString().substring(0, 100) : null;
 
     // Initialize database
     try {
       db = getDatabase();
     } catch (error) {
       console.error('[FEED] Firebase initialization failed:', error.message);
-      const response = NextResponse.json(
-        {
-          success: false,
-          error: 'DATABASE_ERROR',
-          message: 'Failed to initialize database',
-        },
-        { status: 500 }
-      );
-      return addCorsHeaders(response);
+      return addCorsHeaders(NextResponse.json({
+        success: false,
+        error: 'DATABASE_ERROR',
+        message: 'Failed to initialize database',
+      }, { status: 500 }));
     }
 
     const feederRef = db.ref('system/feeder');
     const deviceRef = db.ref('system/device');
 
-    // Load data
-    const [feederSnapshot, deviceSnapshot] = await Promise.all([
-      feederRef.once('value'),
-      deviceRef.once('value'),
-    ]);
+    // Load data with timeout protection
+    let feederData, deviceData;
+    try {
+      const [feederSnapshot, deviceSnapshot] = await withTimeout(
+        Promise.all([
+          feederRef.once('value'),
+          deviceRef.once('value'),
+        ]),
+        5000
+      );
 
-    const feederData = feederSnapshot.val() || {};
-    const deviceData = deviceSnapshot.val() || {};
+      feederData = feederSnapshot.val() || {};
+      deviceData = deviceSnapshot.val() || {};
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Database read timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
 
-    if (!feederData) {
-      const response = NextResponse.json({
+    if (!feederData || typeof feederData !== 'object') {
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'NO_FEEDER_DATA',
         message: 'Feeder data not found',
-      });
-      return addCorsHeaders(response);
+      }, { status: 404 }));
     }
 
     // Check 1: Fasting day
     const noFeedDay = feederData.timer?.noFeedDay;
     if (isFastingDay(noFeedDay)) {
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'FASTING_DAY',
         message: 'Today is a fasting day. All feeds are skipped.',
-      });
-      return addCorsHeaders(response);
+      }, { status: 403 }));
     }
 
     // Check 2: Device online
-    const lastSeen = deviceData.lastSeen;
+    const lastSeen = deviceData?.lastSeen;
     if (!isDeviceOnline(lastSeen, deviceData)) {
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'DEVICE_OFFLINE',
         message: 'Device is offline. Cannot execute feed.',
-      });
-      return addCorsHeaders(response);
+      }, { status: 503 }));
     }
 
     // Check 3: Currently feeding
     if (feederData.status === 1) {
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'ALREADY_FEEDING',
         message: 'Device is currently feeding',
-      });
-      return addCorsHeaders(response);
+      }, { status: 409 }));
     }
 
     // Check 4: Cooldown finished (with validation)
     let lastFeedTime = feederData.lastFeedTime || 0;
-    const timerHour = feederData.timer?.hour || 0;
-    const timerMinute = feederData.timer?.minute || 0;
+    const timerHour = Number(feederData.timer?.hour) || 0;
+    const timerMinute = Number(feederData.timer?.minute) || 0;
     const cooldownMs = calculateCooldownMs(timerHour, timerMinute);
 
-    // Validate lastFeedTime (Rule 5)
+    // Validate lastFeedTime
     const MIN_VALID_EPOCH = 946684800000; // Jan 1, 2000
     if (lastFeedTime < MIN_VALID_EPOCH && lastFeedTime > 0) {
       console.warn('[FEED] Invalid lastFeedTime detected:', lastFeedTime, '- Using current time');
@@ -109,71 +138,86 @@ export async function POST(request) {
     }
 
     if (!canFeed(lastFeedTime, cooldownMs)) {
-      // Calculate remaining time (only if lastFeedTime is valid)
       const cooldownEndsAt = lastFeedTime + cooldownMs;
-      const remainingMs = cooldownEndsAt - Date.now();
+      const remainingMs = Math.max(0, cooldownEndsAt - Date.now());
       const remainingMinutes = Math.ceil(remainingMs / 60000);
 
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'COOLDOWN_ACTIVE',
         message: `Cooldown active. Time remaining: ${remainingMinutes} minutes`,
         cooldownEndsAt,
-      });
-      return addCorsHeaders(response);
+        remainingMinutes,
+      }, { status: 429 }));
     }
 
     // Check 5: No reservations exist (reservations have priority)
-    const reservations = feederData.reservations || [];
-    const validReservations = reservations.filter((r) => r && r.scheduledTime);
+    const reservations = Array.isArray(feederData.reservations) ? feederData.reservations : [];
+    const validReservations = reservations.filter((r) => r && typeof r === 'object' && r.scheduledTime);
 
     if (validReservations.length > 0) {
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'RESERVATIONS_EXIST',
         message: 'Cannot manual feed when reservations exist. Reservations have priority.',
         reservationCount: validReservations.length,
-      });
-      return addCorsHeaders(response);
+      }, { status: 409 }));
     }
 
     // All checks passed - execute manual feed
-    const { timestampMs } = await triggerFeed({
+    const now = new Date();
+    let timestampMs;
+    try {
+      const result = await withTimeout(
+        triggerFeed({
+          type: 'manual',
+          user: user || userEmail || 'Visitor',
+          db,
+          feederRef,
+          now,
+        }),
+        5000
+      );
+      timestampMs = result.timestampMs;
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Feed trigger timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
+
+    // Send Telegram notification (non-blocking)
+    sendFeedExecutedMessage({
       type: 'manual',
       user: user || userEmail || 'Visitor',
-      db,
-      feederRef,
-      now,
-    });
-
-    // Send Telegram notification
-    await sendFeedExecutedMessage({
-      type: 'manual',
-      user: user || userEmail || 'Visitor',
       now,
       db,
-    });
+    }).catch(err => console.error('[FEED] Telegram notification failed:', err.message));
 
-    const response = NextResponse.json({
+    const elapsed = Date.now() - startTime;
+    console.log(`[FEED] Manual feed executed in ${elapsed}ms`);
+
+    return addCorsHeaders(NextResponse.json({
       success: true,
       message: 'Feed executed successfully',
       feedTime: timestampMs,
       type: 'manual',
       user: user || userEmail || 'Visitor',
-    });
+    }));
 
-    return addCorsHeaders(response);
   } catch (error) {
-    console.error('[FEED] Error:', error);
-    const response = NextResponse.json(
-      {
-        success: false,
-        error: 'INTERNAL_ERROR',
-        message: error.message,
-      },
-      { status: 500 }
-    );
-    return addCorsHeaders(response);
+    const elapsed = Date.now() - startTime;
+    console.error(`[FEED] Error after ${elapsed}ms:`, error.message);
+    
+    return addCorsHeaders(NextResponse.json({
+      success: false,
+      error: 'INTERNAL_ERROR',
+      message: error.message || 'An unexpected error occurred',
+    }, { status: 500 }));
   }
 }
 

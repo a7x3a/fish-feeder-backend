@@ -1,11 +1,23 @@
 import { NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/services/firebase.js';
-import { calculateCooldownMs, calculateScheduledTime } from '@/lib/utils/feeder.js';
+import { calculateCooldownMs } from '@/lib/utils/feeder.js';
 import { sendTelegram } from '@/lib/services/telegram.js';
 import { addCorsHeaders, handleCORS } from '@/lib/utils/cors.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+/**
+ * Firebase timeout wrapper
+ */
+async function withTimeout(promise, ms = 5000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('firebase_timeout')), ms)
+    )
+  ]);
+}
 
 /**
  * Cancel Reservation Endpoint
@@ -17,22 +29,31 @@ export async function DELETE(request) {
   const corsResponse = handleCORS(request);
   if (corsResponse) return corsResponse;
 
-  const now = new Date();
+  const startTime = Date.now();
   let db = null;
 
   try {
-    // Get request body
-    const body = await request.json().catch(() => ({}));
-    const deviceId = body.deviceId || null;
-    const userEmail = body.userEmail || null;
+    // Get request body with error handling
+    let body;
+    try {
+      body = await request.json();
+    } catch (error) {
+      return addCorsHeaders(NextResponse.json({
+        success: false,
+        error: 'INVALID_REQUEST',
+        message: 'Invalid JSON in request body',
+      }, { status: 400 }));
+    }
+
+    const deviceId = body.deviceId ? body.deviceId.toString().substring(0, 100) : null;
+    const userEmail = body.userEmail ? body.userEmail.toString().substring(0, 200) : null;
 
     if (!deviceId && !userEmail) {
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'MISSING_PARAMS',
         message: 'deviceId or userEmail required',
-      });
-      return addCorsHeaders(response);
+      }, { status: 400 }));
     }
 
     // Initialize database
@@ -40,35 +61,47 @@ export async function DELETE(request) {
       db = getDatabase();
     } catch (error) {
       console.error('[RESERVATION] Firebase initialization failed:', error.message);
-      const response = NextResponse.json(
-        {
-          success: false,
-          error: 'DATABASE_ERROR',
-          message: 'Failed to initialize database',
-        },
-        { status: 500 }
-      );
-      return addCorsHeaders(response);
+      return addCorsHeaders(NextResponse.json({
+        success: false,
+        error: 'DATABASE_ERROR',
+        message: 'Failed to initialize database',
+      }, { status: 500 }));
     }
 
     const feederRef = db.ref('system/feeder');
 
-    // Load feeder data
-    const feederSnapshot = await feederRef.once('value');
-    const feederData = feederSnapshot.val() || {};
+    // Load feeder data with timeout
+    let feederData;
+    try {
+      const feederSnapshot = await withTimeout(
+        feederRef.once('value'),
+        5000
+      );
+      feederData = feederSnapshot.val() || {};
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Database read timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
 
-    if (!feederData) {
-      const response = NextResponse.json({
+    if (!feederData || typeof feederData !== 'object') {
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'NO_FEEDER_DATA',
         message: 'Feeder data not found',
-      });
-      return addCorsHeaders(response);
+      }, { status: 404 }));
     }
 
     // Find reservation
-    const reservations = feederData.reservations || [];
-    const validReservations = reservations.filter((r) => r && r.scheduledTime);
+    const reservations = Array.isArray(feederData.reservations) ? feederData.reservations : [];
+    const validReservations = reservations.filter((r) => 
+      r && typeof r === 'object' && r.scheduledTime
+    );
 
     const reservationIndex = validReservations.findIndex((r) => {
       if (deviceId && r.deviceId === deviceId) return true;
@@ -77,12 +110,11 @@ export async function DELETE(request) {
     });
 
     if (reservationIndex === -1) {
-      const response = NextResponse.json({
+      return addCorsHeaders(NextResponse.json({
         success: false,
         error: 'RESERVATION_NOT_FOUND',
         message: 'Reservation not found',
-      });
-      return addCorsHeaders(response);
+      }, { status: 404 }));
     }
 
     // Remove reservation
@@ -91,11 +123,11 @@ export async function DELETE(request) {
 
     // Recalculate remaining reservations' scheduledTimes
     let lastFeedTime = feederData.lastFeedTime || 0;
-    const timerHour = feederData.timer?.hour || 0;
-    const timerMinute = feederData.timer?.minute || 0;
+    const timerHour = Number(feederData.timer?.hour) || 0;
+    const timerMinute = Number(feederData.timer?.minute) || 0;
     const cooldownMs = calculateCooldownMs(timerHour, timerMinute);
 
-    // Validate lastFeedTime (Rule 5)
+    // Validate lastFeedTime
     const MIN_VALID_EPOCH = 946684800000; // Jan 1, 2000
     if (lastFeedTime < MIN_VALID_EPOCH && lastFeedTime > 0) {
       console.warn('[RESERVATION] Invalid lastFeedTime detected:', lastFeedTime, '- Using current time');
@@ -114,31 +146,47 @@ export async function DELETE(request) {
       currentScheduledTime = scheduledTime + cooldownMs;
     }
 
-    await feederRef.child('reservations').set(recalculatedReservations);
+    // Update reservations with timeout
+    try {
+      await withTimeout(
+        feederRef.child('reservations').set(recalculatedReservations),
+        5000
+      );
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Database write timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
 
-    // Send Telegram notification
-    await sendTelegram(
-      `🐟 <b>FISH FEEDER ALERT</b>\n\n❌ Reservation Cancelled\n👤 User: ${removedReservation.user}\n\nReservation removed from queue.`,
+    // Send Telegram notification (non-blocking)
+    const userName = removedReservation.user || 'Unknown';
+    sendTelegram(
+      `❌ Reservation Cancelled\n👤 User: ${userName}\n\nReservation removed from queue.`,
       db
-    );
+    ).catch(err => console.error('[RESERVATION] Telegram notification failed:', err.message));
 
-    const response = NextResponse.json({
+    const elapsed = Date.now() - startTime;
+    console.log(`[RESERVATION] Cancelled in ${elapsed}ms`);
+
+    return addCorsHeaders(NextResponse.json({
       success: true,
       message: 'Reservation cancelled successfully',
-    });
+    }));
 
-    return addCorsHeaders(response);
   } catch (error) {
-    console.error('[RESERVATION] Error:', error);
-    const response = NextResponse.json(
-      {
-        success: false,
-        error: 'INTERNAL_ERROR',
-        message: error.message,
-      },
-      { status: 500 }
-    );
-    return addCorsHeaders(response);
+    const elapsed = Date.now() - startTime;
+    console.error(`[RESERVATION] Error after ${elapsed}ms:`, error.message);
+    
+    return addCorsHeaders(NextResponse.json({
+      success: false,
+      error: 'INTERNAL_ERROR',
+      message: error.message || 'An unexpected error occurred',
+    }, { status: 500 }));
   }
 }
 
@@ -148,4 +196,3 @@ export async function DELETE(request) {
 export async function OPTIONS(request) {
   return handleCORS(request);
 }
-
