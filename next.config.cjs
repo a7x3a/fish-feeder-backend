@@ -19,6 +19,11 @@ const nextConfig = {
         tls: false,
       };
     }
+    // Add path alias for lib imports
+    config.resolve.alias = {
+      ...config.resolve.alias,
+      '@': require('path').resolve(__dirname),
+    };
     return config;
   },
   

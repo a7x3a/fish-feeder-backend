@@ -1,41 +1,10 @@
 import { NextResponse } from 'next/server';
-import admin from 'firebase-admin';
+import { getDatabase } from '@/lib/services/firebase.js';
+import { sendTelegramMessage, formatDate } from '@/lib/services/telegram.js';
+import { addCorsHeaders, handleCORS } from '@/lib/utils/cors.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-
-/**
- * Lazily initialize and return the Firebase Realtime Database instance.
- */
-function getDatabase() {
-  if (!admin.apps.length) {
-    try {
-      const serviceAccountStr = process.env.FIREBASE_SERVICE_ACCOUNT;
-
-      if (!serviceAccountStr || serviceAccountStr === '{}') {
-        throw new Error('FIREBASE_SERVICE_ACCOUNT not available');
-      }
-
-      const serviceAccount = JSON.parse(serviceAccountStr);
-
-      if (!serviceAccount.project_id) {
-        throw new Error('Service account object must contain a string "project_id" property.');
-      }
-
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL:
-          process.env.FIREBASE_DB_URL ||
-          'https://fishfeeder-81131-default-rtdb.firebaseio.com/',
-      });
-    } catch (error) {
-      console.error('Firebase Admin initialization error:', error);
-      throw error;
-    }
-  }
-
-  return admin.database();
-}
 
 /**
  * Convert Firebase timestamp fields (or legacy number) into a JS Date.
@@ -70,24 +39,7 @@ function fieldsToDate(fields) {
 }
 
 /**
- * Format date for display.
- */
-function formatDate(date) {
-  if (!date) return 'N/A';
-  try {
-    return date.toLocaleString('en-US', {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  } catch {
-    return 'N/A';
-  }
-}
-
-/**
- * Send a Telegram message.
+ * Send a Telegram message (simple version without message limit management).
  */
 async function sendTelegramMessage(message) {
   try {
@@ -203,11 +155,11 @@ async function handleStatusCommand(db) {
     const servoStatus = deviceData?.servo || 'off';
     const uptime = deviceData?.uptime || 0;
 
-    const lastFeedTime = fieldsToDate(feederData.lastFeedTime);
-    const timerHours = feederData.timer?.hour || feederData.timerHours || 0;
-    const timerMinutes = feederData.timer?.minute || feederData.timerMinutes || 0;
-    const cooldownMs = timerHours * 3600000 + timerMinutes * 60000;
-    const autoFeedDelayMinutes = feederData.delays?.autoFeedDelayMinutes || 30;
+    const lastFeedTime = feederData.lastFeedTime ? new Date(feederData.lastFeedTime) : null;
+    const timerHour = feederData.timer?.hour || 0;
+    const timerMinute = feederData.timer?.minute || 0;
+    const cooldownMs = timerHour * 3600000 + timerMinute * 60000;
+    const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
     const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
 
     const nextFeedTime = lastFeedTime
@@ -264,7 +216,10 @@ async function handleHistoryCommand(db) {
     const lines = ['📜 <b>LAST 5 FEEDS</b>', ''];
 
     last5.forEach((entry, index) => {
-      const date = fieldsToDate(entry.dateFields) || new Date(entry.timestamp);
+      const timestamp = typeof entry.timestamp === 'string' 
+        ? parseInt(entry.timestamp, 10) 
+        : entry.timestamp;
+      const date = timestamp ? new Date(timestamp) : new Date();
       const type = entry.type || 'unknown';
       const user = entry.user || 'System';
       const timeStr = formatDate(date);
@@ -297,7 +252,10 @@ async function handleReservationsCommand(db) {
     const lines = ['📌 <b>ACTIVE RESERVATIONS</b>', ''];
 
     validReservations.forEach((reservation, index) => {
-      const scheduledDate = fieldsToDate(reservation.scheduledTime);
+      const scheduledTime = typeof reservation.scheduledTime === 'number' 
+        ? reservation.scheduledTime 
+        : parseInt(reservation.scheduledTime, 10);
+      const scheduledDate = scheduledTime ? new Date(scheduledTime) : null;
       const timeStr = formatDate(scheduledDate);
       const user = reservation.user || 'unknown';
       lines.push(`${index + 1}. ${user} – ${timeStr}`);
@@ -328,12 +286,17 @@ function handleHelpCommand() {
  * Handle Telegram webhook POST requests.
  */
 export async function POST(request) {
+  // Handle CORS preflight
+  const corsResponse = handleCORS(request);
+  if (corsResponse) return corsResponse;
+
   try {
     const body = await request.json();
 
     // Check if it's a message update
     if (!body.message || !body.message.text) {
-      return NextResponse.json({ ok: true });
+      const response = NextResponse.json({ ok: true });
+      return addCorsHeaders(response);
     }
 
     const messageText = body.message.text.trim();
@@ -343,7 +306,8 @@ export async function POST(request) {
     const configuredChatId = process.env.TELEGRAM_CHAT_ID;
     if (String(chatId) !== String(configuredChatId)) {
       console.warn(`[TELEGRAM] Received message from unauthorized chat: ${chatId}`);
-      return NextResponse.json({ ok: true });
+      const response = NextResponse.json({ ok: true });
+      return addCorsHeaders(response);
     }
 
     let db;
@@ -352,7 +316,8 @@ export async function POST(request) {
     } catch (error) {
       console.error('[TELEGRAM] Firebase initialization failed:', error);
       await sendTelegramMessage('❌ Error: Failed to initialize database.');
-      return NextResponse.json({ ok: true });
+      const response = NextResponse.json({ ok: true });
+      return addCorsHeaders(response);
     }
 
     let responseMessage = '';
@@ -375,17 +340,20 @@ export async function POST(request) {
       }
     } else {
       // Unknown command - ignore
-      return NextResponse.json({ ok: true });
+      const response = NextResponse.json({ ok: true });
+      return addCorsHeaders(response);
     }
 
     if (responseMessage) {
       await sendTelegramMessage(responseMessage);
     }
 
-    return NextResponse.json({ ok: true });
+    const response = NextResponse.json({ ok: true });
+    return addCorsHeaders(response);
   } catch (error) {
     console.error('[TELEGRAM] Webhook error:', error);
-    return NextResponse.json({ ok: true });
+    const response = NextResponse.json({ ok: true });
+    return addCorsHeaders(response);
   }
 }
 
@@ -393,7 +361,15 @@ export async function POST(request) {
  * Handle GET requests (for webhook verification).
  */
 export async function GET() {
-  return NextResponse.json({
+  const response = NextResponse.json({
     message: 'Telegram webhook endpoint. Use POST to send updates.',
   });
+  return addCorsHeaders(response);
+}
+
+/**
+ * Handle OPTIONS for CORS
+ */
+export async function OPTIONS(request) {
+  return handleCORS(request);
 }

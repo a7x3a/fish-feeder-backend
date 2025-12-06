@@ -438,7 +438,7 @@ This system must ensure:
 ✔️ No duplicate alerts  
 ✔️ Feeds, alerts, scheduler always stable  
 ✔️ ESP and cloud remain in sync  
-✔️ Perfect safety for fish  git
+✔️ Perfect safety for fish  
 
 ---
 
