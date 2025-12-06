@@ -67,7 +67,7 @@ export async function GET(request) {
     const canFeedNow = Date.now() >= cooldownEndsAt && (feederData.reservations || []).length === 0;
 
     const lastSeen = deviceData.lastSeen;
-    const isOnline = isDeviceOnline(lastSeen);
+    const isOnline = isDeviceOnline(lastSeen, deviceData);
     const isFasting = isFastingDay(feederData.timer?.noFeedDay);
 
     const response = NextResponse.json({

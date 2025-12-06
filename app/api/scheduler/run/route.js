@@ -77,7 +77,7 @@ export async function GET(request) {
 
     // Check device online
     const lastSeen = deviceData.lastSeen;
-    if (!isDeviceOnline(lastSeen)) {
+    if (!isDeviceOnline(lastSeen, deviceData)) {
       const response = NextResponse.json({ ok: true, type: 'none', reason: 'device_offline' });
       return addCorsHeaders(response);
     }

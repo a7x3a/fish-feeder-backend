@@ -77,10 +77,23 @@ export async function POST(request) {
 
     // Step 3: Check device online
     const lastSeen = deviceData.lastSeen;
-    if (!isDeviceOnline(lastSeen)) {
+    const isOnline = isDeviceOnline(lastSeen, deviceData);
+    
+    if (!isOnline) {
+      console.error('[CRON] Device offline check failed:', {
+        lastSeen,
+        uptime: deviceData.uptime,
+        wifi: deviceData.wifi,
+        deviceData: JSON.stringify(deviceData)
+      });
       const response = NextResponse.json({
         type: 'none',
         reason: 'device_offline',
+        debug: {
+          lastSeen,
+          uptime: deviceData.uptime,
+          wifi: deviceData.wifi,
+        }
       });
       return addCorsHeaders(response);
     }

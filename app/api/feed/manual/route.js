@@ -76,7 +76,7 @@ export async function POST(request) {
 
     // Check 2: Device online
     const lastSeen = deviceData.lastSeen;
-    if (!isDeviceOnline(lastSeen)) {
+    if (!isDeviceOnline(lastSeen, deviceData)) {
       const response = NextResponse.json({
         success: false,
         error: 'DEVICE_OFFLINE',

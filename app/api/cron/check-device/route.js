@@ -51,7 +51,7 @@ export async function POST(request) {
     const deviceData = deviceSnapshot.val() || {};
 
     const lastSeen = deviceData.lastSeen;
-    const isOnline = isDeviceOnline(lastSeen);
+    const isOnline = isDeviceOnline(lastSeen, deviceData);
 
     // Check alerts for throttling
     const alertsSnapshot = await alertsRef.once('value');
