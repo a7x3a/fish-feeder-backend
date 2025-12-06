@@ -344,12 +344,40 @@ async function executeCron(request) {
     }
 
     // Step 12: Nothing to execute
+    // This is a NORMAL response - cron checked everything, but no feed is needed right now
+    // Reasons could be:
+    // - No reservations ready yet (scheduledTime hasn't arrived)
+    // - Cooldown still active (lastFeedTime + cooldownMs hasn't passed)
+    // - Auto-feed delay hasn't passed (cooldownEndTime + autoFeedDelayMs hasn't passed)
     const elapsed = Date.now() - startTime;
+    
+    // Log detailed info for debugging
+    const reservationsCount = validReservations.length;
+    const readyCount = readyReservations.length;
+    const cooldownEndsAt = lastFeedTime + cooldownMs;
+    const cooldownRemaining = Math.max(0, cooldownEndsAt - Date.now());
+    const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
+    const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
+    const autoFeedTime = cooldownEndsAt + autoFeedDelayMs;
+    const autoFeedRemaining = Math.max(0, autoFeedTime - Date.now());
+    
     console.log(`[CRON] done in ${elapsed}ms - no_feed_needed`);
+    console.log(`[CRON] Status: ${reservationsCount} total reservations, ${readyCount} ready`);
+    console.log(`[CRON] Cooldown remaining: ${Math.floor(cooldownRemaining / 1000)}s`);
+    if (validReservations.length === 0) {
+      console.log(`[CRON] Auto-feed remaining: ${Math.floor(autoFeedRemaining / 1000)}s`);
+    }
 
     return NextResponse.json({
       type: 'none',
       reason: 'no_feed_needed',
+      // Add helpful debug info (optional - can be removed in production)
+      debug: {
+        reservationsCount,
+        readyReservationsCount: readyCount,
+        cooldownRemainingMs: cooldownRemaining,
+        autoFeedRemainingMs: validReservations.length === 0 ? autoFeedRemaining : null,
+      }
     });
 
   } catch (error) {
