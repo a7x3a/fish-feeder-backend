@@ -85,31 +85,18 @@ async function executeCron(request) {
     const deviceRef = db.ref('system/device');
 
     // Step 3: Load data with timeout protection
-    // Try to read only feeder data first (faster), then device if needed
-    let feederData, deviceData;
+    // CRITICAL: Read feeder data first (most important), device is optional
+    let feederData;
     try {
-      // Read feeder first (most important)
+      // Read feeder with aggressive timeout (5 seconds max for FastCron)
       const feederSnapshot = await withTimeout(
         feederRef.once('value'),
-        8000 // 8 second timeout for reads
+        5000 // 5 second timeout - FastCron needs fast responses
       );
       feederData = feederSnapshot.val() || {};
-
-      // Read device data (can be slower, but we need it)
-      try {
-        const deviceSnapshot = await withTimeout(
-          deviceRef.once('value'),
-          6000 // 6 second timeout for device read
-        );
-        deviceData = deviceSnapshot.val() || {};
-      } catch (deviceError) {
-        // If device read fails, use empty object (non-critical for some checks)
-        console.warn('[CRON] Device read failed, using defaults:', deviceError.message);
-        deviceData = {};
-      }
     } catch (error) {
       if (error.message === 'firebase_timeout') {
-        console.log('[CRON] firebase_timeout on read');
+        console.log('[CRON] firebase_timeout on feeder read');
         return NextResponse.json({
           error: 'firebase_timeout',
           type: 'none'
@@ -117,6 +104,21 @@ async function executeCron(request) {
       }
       throw error;
     }
+
+    // Read device data in parallel (non-blocking - don't wait for it)
+    // If it fails, we'll use defaults - device check is not critical
+    let deviceData = {};
+    const deviceReadPromise = deviceRef.once('value')
+      .then(snapshot => {
+        deviceData = snapshot.val() || {};
+      })
+      .catch(err => {
+        console.warn('[CRON] Device read failed (non-critical):', err.message);
+        deviceData = {}; // Use defaults
+      });
+    
+    // Don't wait for device read - continue with feeder data
+    // Device check will use defaults if read hasn't completed
 
     if (!feederData) {
       console.log('[CRON] no_feeder_data');
@@ -137,23 +139,24 @@ async function executeCron(request) {
     }
 
     // Step 5: Check device online (60 second threshold)
-    // If device data is missing, assume online (graceful degradation)
+    // Device read is non-blocking, so check if we have data yet
+    // If device data is missing, assume online (graceful degradation for FastCron)
     const lastSeen = deviceData?.lastSeen;
-    const isOnline = isDeviceOnlineFast(lastSeen, deviceData);
     
-    if (!isOnline && lastSeen) {
-      // Only fail if we have lastSeen data and it's stale
-      // If device data read failed, give benefit of doubt
-      console.log('[CRON] device_offline');
-      return NextResponse.json({
-        type: 'none',
-        reason: 'device_offline'
-      });
-    }
-    
-    // If device data is missing but feeder data exists, continue (device might be syncing)
-    if (!lastSeen && Object.keys(deviceData).length === 0) {
-      console.warn('[CRON] Device data missing, but continuing (graceful degradation)');
+    // Only check device if we have lastSeen data (device read completed)
+    // If device read is still pending or failed, assume online
+    if (lastSeen !== undefined && lastSeen !== null) {
+      const isOnline = isDeviceOnlineFast(lastSeen, deviceData);
+      if (!isOnline) {
+        console.log('[CRON] device_offline');
+        return NextResponse.json({
+          type: 'none',
+          reason: 'device_offline'
+        });
+      }
+    } else {
+      // Device data not available yet or read failed - assume online (graceful degradation)
+      console.warn('[CRON] Device data not available, assuming online (graceful degradation)');
     }
 
     // Step 6: Check status before feeding (prevent conflicts)
@@ -211,7 +214,7 @@ async function executeCron(request) {
 
       const now = new Date();
 
-      // Trigger feed with timeout protection
+      // Trigger feed with timeout protection (aggressive timeout for FastCron)
       let timestampMs;
       try {
         const result = await withTimeout(
@@ -222,7 +225,7 @@ async function executeCron(request) {
             feederRef,
             now,
           }),
-          10000 // 10 second timeout for feed trigger (critical operation)
+          7000 // 7 second timeout for feed trigger (FastCron needs fast responses)
         );
         timestampMs = result.timestampMs;
       } catch (error) {
@@ -304,7 +307,7 @@ async function executeCron(request) {
       if (Date.now() >= autoFeedTime) {
         const now = new Date();
 
-        // Execute auto feed with timeout
+        // Execute auto feed with timeout (aggressive timeout for FastCron)
         try {
           await withTimeout(
             triggerFeed({
@@ -314,7 +317,7 @@ async function executeCron(request) {
               feederRef,
               now,
             }),
-            10000 // 10 second timeout for feed trigger (critical operation)
+            7000 // 7 second timeout for feed trigger (FastCron needs fast responses)
           );
         } catch (error) {
           if (error.message === 'firebase_timeout') {

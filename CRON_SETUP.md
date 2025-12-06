@@ -37,14 +37,14 @@ Content-Type: application/json
 2. Fill in the details:
    - **Name:** FishFeeder Auto Feed
    - **URL:** `https://your-backend-domain.vercel.app/api/cron/execute`
-   - **Method:** `POST`
+   - **Method:** `GET` or `POST` (both supported)
    - **Schedule:** Every 5 minutes (`*/5 * * * *`)
    - **Headers:**
      ```
      Authorization: Bearer YOUR_CRON_SECRET
-     Content-Type: application/json
      ```
-   - **Body:** Leave empty
+   - **Body:** Leave empty (not needed for GET)
+   - **Note:** The endpoint supports both GET and POST for maximum compatibility
 
 **For Cron-Job.org:**
 1. Click "Create cronjob"
