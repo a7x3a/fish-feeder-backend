@@ -80,20 +80,10 @@ export async function POST(request) {
     const isOnline = isDeviceOnline(lastSeen, deviceData);
     
     if (!isOnline) {
-      console.error('[CRON] Device offline check failed:', {
-        lastSeen,
-        uptime: deviceData.uptime,
-        wifi: deviceData.wifi,
-        deviceData: JSON.stringify(deviceData)
-      });
+      // Reduced logging to avoid timeout
       const response = NextResponse.json({
         type: 'none',
         reason: 'device_offline',
-        debug: {
-          lastSeen,
-          uptime: deviceData.uptime,
-          wifi: deviceData.wifi,
-        }
       });
       return addCorsHeaders(response);
     }
@@ -186,12 +176,12 @@ export async function POST(request) {
 
       await feederRef.child('reservations').set(recalculatedReservations);
 
-      // Send Telegram notification
-      await sendReservationExecutedMessage({
+      // Send Telegram notification (non-blocking - don't wait for it)
+      sendReservationExecutedMessage({
         user: reservationUser,
         now,
         db,
-      });
+      }).catch(err => console.error('[CRON] Telegram notification failed:', err));
 
       const response = NextResponse.json({
         type: 'reservation',
@@ -220,15 +210,6 @@ export async function POST(request) {
       // Auto feed should trigger after delay from cooldown end
       const autoFeedTime = cooldownEndTime + autoFeedDelayMs;
 
-      console.log('[CRON] Auto feed check:', {
-        lastFeedTime,
-        cooldownEndTime,
-        autoFeedDelayMs,
-        autoFeedTime,
-        now: Date.now(),
-        canTrigger: Date.now() >= autoFeedTime
-      });
-
       if (Date.now() >= autoFeedTime) {
         // Execute auto feed
         const { timestampMs } = await triggerFeed({
@@ -239,19 +220,14 @@ export async function POST(request) {
           now,
         });
 
-        // Send Telegram notification
-        await sendAutoFeedMessage({ now, db });
+        // Send Telegram notification (non-blocking - don't wait for it)
+        sendAutoFeedMessage({ now, db }).catch(err => console.error('[CRON] Telegram notification failed:', err));
 
         const response = NextResponse.json({
           type: 'timer',
           user: 'System',
         });
         return addCorsHeaders(response);
-      } else {
-        // Return reason why auto feed didn't trigger
-        const remainingMs = autoFeedTime - Date.now();
-        const remainingMinutes = Math.ceil(remainingMs / 60000);
-        console.log(`[CRON] Auto feed not ready yet. Remaining: ${remainingMinutes} minutes`);
       }
     }
 

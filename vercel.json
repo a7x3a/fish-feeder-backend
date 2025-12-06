@@ -5,6 +5,9 @@
   "framework": "nextjs",
   "regions": ["iad1"],
   "functions": {
+    "app/api/cron/**/*.js": {
+      "maxDuration": 30
+    },
     "app/api/**/*.js": {
       "maxDuration": 10
     }
