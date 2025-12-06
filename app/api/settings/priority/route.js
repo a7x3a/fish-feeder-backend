@@ -7,6 +7,18 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Firebase timeout wrapper
+ */
+async function withTimeout(promise, ms = 8000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('firebase_timeout')), ms)
+    )
+  ]);
+}
+
+/**
  * Update Priority Settings Endpoint
  * PUT /api/settings/priority
  * 
@@ -62,11 +74,25 @@ export async function PUT(request) {
 
     const feederRef = db.ref('system/feeder');
 
-    // Update priority settings
-    await feederRef.child('priority').set({
-      reservationDelayMinutes,
-      autoFeedDelayMinutes,
-    });
+    // Update priority settings with timeout
+    try {
+      await withTimeout(
+        feederRef.child('priority').set({
+          reservationDelayMinutes,
+          autoFeedDelayMinutes,
+        }),
+        8000
+      );
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Database write timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
 
     // Send Telegram notification
     await sendTelegram(

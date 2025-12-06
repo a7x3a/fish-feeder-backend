@@ -7,6 +7,18 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Firebase timeout wrapper
+ */
+async function withTimeout(promise, ms = 8000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('firebase_timeout')), ms)
+    )
+  ]);
+}
+
+/**
  * Get System Status Endpoint
  * GET /api/status
  * 
@@ -39,16 +51,36 @@ export async function GET(request) {
     const deviceRef = db.ref('system/device');
     const sensorsRef = db.ref('system/sensors');
 
-    // Load all data
-    const [feederSnapshot, deviceSnapshot, sensorsSnapshot] = await Promise.all([
-      feederRef.once('value'),
-      deviceRef.once('value'),
-      sensorsRef.once('value'),
-    ]);
-
-    const feederData = feederSnapshot.val() || {};
-    const deviceData = deviceSnapshot.val() || {};
-    const sensors = sensorsSnapshot.val() || {};
+    // Load all data with timeout protection
+    let feederData, deviceData, sensors;
+    try {
+      const [feederSnapshot, deviceSnapshot, sensorsSnapshot] = await withTimeout(
+        Promise.all([
+          feederRef.once('value'),
+          deviceRef.once('value'),
+          sensorsRef.once('value'),
+        ]),
+        8000 // 8 second timeout
+      );
+      
+      feederData = feederSnapshot.val() || {};
+      deviceData = deviceSnapshot.val() || {};
+      sensors = sensorsSnapshot.val() || {};
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        console.error('[STATUS] Firebase timeout');
+        const response = NextResponse.json(
+          {
+            success: false,
+            error: 'TIMEOUT',
+            message: 'Database read timeout',
+          },
+          { status: 504 }
+        );
+        return addCorsHeaders(response);
+      }
+      throw error;
+    }
 
     // Calculate status
     let lastFeedTime = feederData.lastFeedTime || 0;

@@ -8,6 +8,18 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
+ * Firebase timeout wrapper
+ */
+async function withTimeout(promise, ms = 8000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('firebase_timeout')), ms)
+    )
+  ]);
+}
+
+/**
  * Update Timer Settings Endpoint
  * PUT /api/settings/timer
  * 
@@ -73,9 +85,24 @@ export async function PUT(request) {
 
     const feederRef = db.ref('system/feeder');
 
-    // Load current data
-    const feederSnapshot = await feederRef.once('value');
-    const feederData = feederSnapshot.val() || {};
+    // Load current data with timeout
+    let feederData;
+    try {
+      const feederSnapshot = await withTimeout(
+        feederRef.once('value'),
+        8000
+      );
+      feederData = feederSnapshot.val() || {};
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Database read timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
 
     // Get old values
     const oldHour = feederData.timer?.hour || 0;
@@ -92,9 +119,24 @@ export async function PUT(request) {
       timerUpdate.noFeedDay = noFeedDay;
     }
 
-    await feederRef.child('timer').set(timerUpdate);
+    // Update timer with timeout
+    try {
+      await withTimeout(
+        feederRef.child('timer').set(timerUpdate),
+        8000
+      );
+    } catch (error) {
+      if (error.message === 'firebase_timeout') {
+        return addCorsHeaders(NextResponse.json({
+          success: false,
+          error: 'TIMEOUT',
+          message: 'Database write timeout',
+        }, { status: 504 }));
+      }
+      throw error;
+    }
 
-    // Recalculate all reservation scheduledTimes with new cooldown
+    // Recalculate all reservation scheduledTimes with new cooldown (non-blocking)
     const reservations = feederData.reservations || [];
     const validReservations = reservations.filter((r) => r && r.scheduledTime);
 
@@ -114,7 +156,11 @@ export async function PUT(request) {
         currentScheduledTime = scheduledTime + newCooldownMs;
       }
 
-      await feederRef.child('reservations').set(recalculatedReservations);
+      // Update reservations (non-blocking - fire and forget)
+      setTimeout(() => {
+        feederRef.child('reservations').set(recalculatedReservations)
+          .catch(err => console.error('[SETTINGS] Error updating reservations:', err.message));
+      }, 0);
     }
 
     // Send Telegram notification if changed
