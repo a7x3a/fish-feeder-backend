@@ -188,10 +188,33 @@ export async function POST(request) {
     }
 
     // Step 9: Auto feed (Priority 2 - only if no reservations)
+    // NOTE: We've already passed the cooldown check in Step 7, so we only need to check the delay
     if (validReservations.length === 0) {
       const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
       const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
-      const autoFeedTime = lastFeedTime + cooldownMs + autoFeedDelayMs;
+      
+      // Calculate when auto feed should trigger
+      // Since cooldown already passed, we calculate from when cooldown ended
+      let cooldownEndTime;
+      if (lastFeedTime === 0 || lastFeedTime < MIN_VALID_EPOCH) {
+        // No previous feed - cooldown ended immediately
+        cooldownEndTime = Date.now();
+      } else {
+        // Cooldown ended at lastFeedTime + cooldownMs
+        cooldownEndTime = lastFeedTime + cooldownMs;
+      }
+      
+      // Auto feed should trigger after delay from cooldown end
+      const autoFeedTime = cooldownEndTime + autoFeedDelayMs;
+
+      console.log('[CRON] Auto feed check:', {
+        lastFeedTime,
+        cooldownEndTime,
+        autoFeedDelayMs,
+        autoFeedTime,
+        now: Date.now(),
+        canTrigger: Date.now() >= autoFeedTime
+      });
 
       if (Date.now() >= autoFeedTime) {
         // Execute auto feed
@@ -211,6 +234,11 @@ export async function POST(request) {
           user: 'System',
         });
         return addCorsHeaders(response);
+      } else {
+        // Return reason why auto feed didn't trigger
+        const remainingMs = autoFeedTime - Date.now();
+        const remainingMinutes = Math.ceil(remainingMs / 60000);
+        console.log(`[CRON] Auto feed not ready yet. Remaining: ${remainingMinutes} minutes`);
       }
     }
 
