@@ -273,15 +273,19 @@ async function executeCron(request) {
           });
       }, 0);
 
-      // Send Telegram notification (non-blocking but log if it fails)
-      sendReservationExecutedMessage({
-        user: reservationUser,
-        now,
-        db,
-      }).catch(err => {
+      // Send Telegram notification and capture status for debug
+      let telegramStatus = null;
+      try {
+        telegramStatus = await sendReservationExecutedMessage({
+          user: reservationUser,
+          now,
+          db,
+        });
+      } catch (err) {
         console.error('[CRON] Telegram notification failed:', err.message);
         console.error('[CRON] Telegram error details:', err);
-      });
+        telegramStatus = { success: false, error: err.message };
+      }
 
       const elapsed = Date.now() - startTime;
       console.log(`[CRON] reservation_executed in ${elapsed}ms`);
@@ -289,6 +293,7 @@ async function executeCron(request) {
       return NextResponse.json({
         type: 'reservation',
         user: reservationUser,
+        telegram: telegramStatus || { success: false, error: 'NOT_ATTEMPTED' }
       });
     }
 
@@ -338,11 +343,15 @@ async function executeCron(request) {
           throw error;
         }
 
-        // Send Telegram notification (non-blocking but log if it fails)
-        sendAutoFeedMessage({ now, db }).catch(err => {
+        // Send Telegram notification and capture status for debug
+        let telegramStatus = null;
+        try {
+          telegramStatus = await sendAutoFeedMessage({ now, db });
+        } catch (err) {
           console.error('[CRON] Telegram notification failed:', err.message);
           console.error('[CRON] Telegram error details:', err);
-        });
+          telegramStatus = { success: false, error: err.message };
+        }
 
         const elapsed = Date.now() - startTime;
         console.log(`[CRON] auto_feed_executed in ${elapsed}ms`);
@@ -350,6 +359,7 @@ async function executeCron(request) {
         return NextResponse.json({
           type: 'timer',
           user: 'System',
+          telegram: telegramStatus || { success: false, error: 'NOT_ATTEMPTED' }
         });
       }
     }
