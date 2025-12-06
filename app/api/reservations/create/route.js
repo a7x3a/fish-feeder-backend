@@ -112,10 +112,17 @@ export async function POST(request) {
     }
 
     // Calculate scheduled time
-    const lastFeedTime = feederData.lastFeedTime || 0;
+    let lastFeedTime = feederData.lastFeedTime || 0;
     const timerHour = feederData.timer?.hour || 0;
     const timerMinute = feederData.timer?.minute || 0;
     const cooldownMs = calculateCooldownMs(timerHour, timerMinute);
+
+    // Validate lastFeedTime (Rule 5)
+    const MIN_VALID_EPOCH = 946684800000; // Jan 1, 2000
+    if (lastFeedTime < MIN_VALID_EPOCH && lastFeedTime > 0) {
+      console.warn('[RESERVATION] Invalid lastFeedTime detected:', lastFeedTime, '- Using current time');
+      lastFeedTime = Date.now();
+    }
 
     const scheduledTime = calculateScheduledTime(validReservations, lastFeedTime, cooldownMs);
     const createdAt = Date.now();

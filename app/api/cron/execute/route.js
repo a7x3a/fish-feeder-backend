@@ -1,20 +1,21 @@
 import { NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/services/firebase.js';
-import { sendTelegram, formatDate } from '@/lib/services/telegram.js';
+import { triggerFeed, sendReservationExecutedMessage, sendAutoFeedMessage, isFastingDay, calculateCooldownMs, isDeviceOnline, canFeed } from '@/lib/utils/feeder.js';
 import { isAuthorizedRequest } from '@/lib/utils/auth.js';
 import { addCorsHeaders, handleCORS } from '@/lib/utils/cors.js';
-import { triggerFeed, sendReservationExecutedMessage, sendAutoFeedMessage, isFastingDay, calculateCooldownMs, isDeviceOnline, canFeed } from '@/lib/utils/feeder.js';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 /**
- * Main Scheduler Endpoint
- * GET /api/scheduler/run
+ * Unified Cron Execute Endpoint
+ * POST /api/cron/execute
  * 
- * Combines execute-reservations and auto-feed logic
+ * Handles both reservations and auto-feed execution (called by FastCron every 5 minutes)
+ * 
+ * Headers: Authorization: Bearer CRON_SECRET
  */
-export async function GET(request) {
+export async function POST(request) {
   const corsResponse = handleCORS(request);
   if (corsResponse) return corsResponse;
 
@@ -22,30 +23,23 @@ export async function GET(request) {
   let db = null;
 
   try {
+    // Step 1: Verify CRON_SECRET
     const cronSecret = process.env.CRON_SECRET;
-
     if (!isAuthorizedRequest(request, cronSecret)) {
-      const response = NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      const response = NextResponse.json(
+        { success: false, error: 'UNAUTHORIZED' },
+        { status: 401 }
+      );
       return addCorsHeaders(response);
     }
-
-    console.log('[SCHEDULER] Starting scheduler run...');
 
     // Initialize database
     try {
       db = getDatabase();
-      await sendTelegram(
-        [
-          '🔄 <b>Scheduler Run Started</b>',
-          `⏰ ${formatDate(now)}`,
-          'Checking for feeds and system status...',
-        ].join('\n'),
-        db
-      );
     } catch (error) {
-      console.error('[SCHEDULER] Firebase initialization failed:', error.message);
+      console.error('[CRON] Firebase initialization failed:', error.message);
       const response = NextResponse.json(
-        { ok: false, error: 'Firebase initialization failed', message: error.message },
+        { success: false, error: 'DATABASE_ERROR' },
         { status: 500 }
       );
       return addCorsHeaders(response);
@@ -64,67 +58,88 @@ export async function GET(request) {
     const deviceData = deviceSnapshot.val() || {};
 
     if (!feederData) {
-      const response = NextResponse.json({ ok: false, error: 'No feeder data found' });
+      const response = NextResponse.json({
+        type: 'none',
+        reason: 'NO_FEEDER_DATA',
+      });
       return addCorsHeaders(response);
     }
 
-    // Check fasting day
+    // Step 2: Check fasting day
     const noFeedDay = feederData.timer?.noFeedDay;
     if (isFastingDay(noFeedDay)) {
-      const response = NextResponse.json({ ok: true, type: 'none', reason: 'fasting_day' });
+      const response = NextResponse.json({
+        type: 'none',
+        reason: 'fasting_day',
+      });
       return addCorsHeaders(response);
     }
 
-    // Check device online
+    // Step 3: Check device online
     const lastSeen = deviceData.lastSeen;
     if (!isDeviceOnline(lastSeen)) {
-      const response = NextResponse.json({ ok: true, type: 'none', reason: 'device_offline' });
+      const response = NextResponse.json({
+        type: 'none',
+        reason: 'device_offline',
+      });
       return addCorsHeaders(response);
     }
 
-    // Check if currently feeding
+    // Step 4: Check status before feeding (prevent conflicts)
     if (feederData.status === 1) {
-      const response = NextResponse.json({ ok: true, type: 'none', reason: 'already_feeding' });
+      const response = NextResponse.json({
+        type: 'none',
+        reason: 'already_feeding',
+      });
       return addCorsHeaders(response);
     }
 
+    // Step 5: Get lastFeedTime and cooldown
     let lastFeedTime = feederData.lastFeedTime || 0;
     const timerHour = feederData.timer?.hour || 0;
     const timerMinute = feederData.timer?.minute || 0;
     const cooldownMs = calculateCooldownMs(timerHour, timerMinute);
 
-    // Validate lastFeedTime (Rule 5)
+    // Step 6: Validate lastFeedTime (Rule 5)
     const MIN_VALID_EPOCH = 946684800000; // Jan 1, 2000
     if (lastFeedTime < MIN_VALID_EPOCH && lastFeedTime > 0) {
-      console.warn('[SCHEDULER] Invalid lastFeedTime detected:', lastFeedTime, '- Using current time');
+      console.warn('[CRON] Invalid lastFeedTime detected:', lastFeedTime, '- Using current time');
       lastFeedTime = Date.now();
     }
 
-    // Check cooldown (with validation)
+    // Step 7: Check cooldown finished
     if (!canFeed(lastFeedTime, cooldownMs)) {
-      const response = NextResponse.json({ ok: true, type: 'none', reason: 'cooldown_active' });
+      const response = NextResponse.json({
+        type: 'none',
+        reason: 'cooldown_active',
+      });
       return addCorsHeaders(response);
     }
 
-    // Priority 1: Check reservations
+    // Step 8: Check reservations (Priority 1)
     const reservations = feederData.reservations || [];
     const validReservations = reservations.filter((r) => r && r.scheduledTime);
 
     const readyReservations = validReservations
       .filter((r) => {
-        const scheduledTime = typeof r.scheduledTime === 'number' ? r.scheduledTime : parseInt(r.scheduledTime, 10);
+        const scheduledTime = typeof r.scheduledTime === 'number' 
+          ? r.scheduledTime 
+          : parseInt(r.scheduledTime, 10);
         return scheduledTime <= Date.now();
       })
       .sort((a, b) => {
+        // Sort by createdAt (FIFO - oldest first)
         const createdAtA = typeof a.createdAt === 'number' ? a.createdAt : parseInt(a.createdAt, 10);
         const createdAtB = typeof b.createdAt === 'number' ? b.createdAt : parseInt(b.createdAt, 10);
         return (createdAtA || 0) - (createdAtB || 0);
       });
 
     if (readyReservations.length > 0) {
+      // Execute first ready reservation
       const reservation = readyReservations[0];
       const reservationUser = reservation.user || 'unknown';
 
+      // Trigger feed (updates lastFeedTime, lastFeed, then status = 1)
       const { timestampMs } = await triggerFeed({
         type: 'reservation',
         user: reservationUser,
@@ -133,6 +148,7 @@ export async function GET(request) {
         now,
       });
 
+      // Remove executed reservation
       const reservationCreatedAt = typeof reservation.createdAt === 'number' 
         ? reservation.createdAt 
         : parseInt(reservation.createdAt, 10);
@@ -142,39 +158,43 @@ export async function GET(request) {
         return createdAt !== reservationCreatedAt;
       });
 
-      // Recalculate remaining reservations
+      // Recalculate remaining reservations' scheduledTimes
       const recalculatedReservations = [];
       let currentScheduledTime = timestampMs + cooldownMs;
 
       for (const res of updatedReservations) {
         const scheduledTime = Math.max(Date.now(), currentScheduledTime);
-        recalculatedReservations.push({ ...res, scheduledTime });
+        recalculatedReservations.push({
+          ...res,
+          scheduledTime,
+        });
         currentScheduledTime = scheduledTime + cooldownMs;
       }
 
       await feederRef.child('reservations').set(recalculatedReservations);
 
-      await sendReservationExecutedMessage({ user: reservationUser, now, db });
+      // Send Telegram notification
+      await sendReservationExecutedMessage({
+        user: reservationUser,
+        now,
+        db,
+      });
 
       const response = NextResponse.json({
-        ok: true,
         type: 'reservation',
         user: reservationUser,
-        feedTime: timestampMs,
       });
       return addCorsHeaders(response);
     }
 
-    // Priority 3: Auto feed (only if no reservations)
+    // Step 9: Auto feed (Priority 2 - only if no reservations)
     if (validReservations.length === 0) {
       const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
       const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
-      // Calculate cooldown end time (use valid lastFeedTime or current time)
-      const validLastFeedTime = lastFeedTime && lastFeedTime > 946684800000 ? lastFeedTime : Date.now();
-      const cooldownEndsAt = validLastFeedTime + cooldownMs;
-      const autoFeedTime = cooldownEndsAt + autoFeedDelayMs;
+      const autoFeedTime = lastFeedTime + cooldownMs + autoFeedDelayMs;
 
       if (Date.now() >= autoFeedTime) {
+        // Execute auto feed
         const { timestampMs } = await triggerFeed({
           type: 'timer',
           user: 'System',
@@ -183,31 +203,30 @@ export async function GET(request) {
           now,
         });
 
+        // Send Telegram notification
         await sendAutoFeedMessage({ now, db });
 
         const response = NextResponse.json({
-          ok: true,
           type: 'timer',
-          feedTime: timestampMs,
+          user: 'System',
         });
         return addCorsHeaders(response);
       }
     }
 
-    // Nothing executed
+    // Step 10: Nothing to execute
     const response = NextResponse.json({
-      ok: true,
       type: 'none',
       reason: 'no_feed_needed',
     });
-
     return addCorsHeaders(response);
   } catch (error) {
-    console.error('[SCHEDULER] Error:', error);
+    console.error('[CRON] Error:', error);
     const response = NextResponse.json(
       {
-        ok: false,
-        error: error.message,
+        success: false,
+        error: 'INTERNAL_ERROR',
+        message: error.message,
       },
       { status: 500 }
     );
@@ -221,3 +240,4 @@ export async function GET(request) {
 export async function OPTIONS(request) {
   return handleCORS(request);
 }
+

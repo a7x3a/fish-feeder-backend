@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/services/firebase.js';
-import { calculateCooldownMs, isDeviceOnline } from '@/lib/utils/feeder.js';
+import { calculateCooldownMs, isDeviceOnline, isFastingDay } from '@/lib/utils/feeder.js';
 import { addCorsHeaders, handleCORS } from '@/lib/utils/cors.js';
 
 export const runtime = 'nodejs';
@@ -51,49 +51,35 @@ export async function GET(request) {
     const sensors = sensorsSnapshot.val() || {};
 
     // Calculate status
-    const lastFeedTime = feederData.lastFeedTime || 0;
+    let lastFeedTime = feederData.lastFeedTime || 0;
     const lastFeed = feederData.lastFeed || {};
     const timerHour = feederData.timer?.hour || 0;
     const timerMinute = feederData.timer?.minute || 0;
     const cooldownMs = calculateCooldownMs(timerHour, timerMinute);
-    const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
-    const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
+    
+    // Validate lastFeedTime (Rule 5)
+    const MIN_VALID_EPOCH = 946684800000; // Jan 1, 2000
+    if (lastFeedTime < MIN_VALID_EPOCH && lastFeedTime > 0) {
+      lastFeedTime = Date.now();
+    }
 
     const cooldownEndsAt = lastFeedTime + cooldownMs;
-    const canFeed = Date.now() >= cooldownEndsAt && (feederData.reservations || []).length === 0;
-    const autoFeedAt = lastFeedTime + cooldownMs + autoFeedDelayMs;
+    const canFeedNow = Date.now() >= cooldownEndsAt && (feederData.reservations || []).length === 0;
 
     const lastSeen = deviceData.lastSeen;
     const isOnline = isDeviceOnline(lastSeen);
+    const isFasting = isFastingDay(feederData.timer?.noFeedDay);
 
     const response = NextResponse.json({
+      ok: true,
       status: feederData.status || 0,
-      lastFeed: lastFeed.timestamp ? {
-        timestamp: lastFeed.timestamp,
-        hour: lastFeed.hour,
-        minute: lastFeed.minute,
-        second: lastFeed.second,
-      } : null,
       lastFeedTime,
-      timer: {
-        hour: timerHour,
-        minute: timerMinute,
-        noFeedDay: feederData.timer?.noFeedDay || null,
-      },
-      device: {
-        wifi: deviceData.wifi || 'disconnected',
-        online: isOnline,
-        uptime: deviceData.uptime || 0,
-        lastSeen,
-      },
-      sensors: {
-        tds: sensors.tds || 0,
-        temperature: sensors.temperature || 0,
-      },
-      reservations: feederData.reservations || [],
-      canFeed,
+      cooldownMs,
       cooldownEndsAt,
-      autoFeedAt,
+      canFeed: canFeedNow,
+      reservationsCount: (feederData.reservations || []).length,
+      deviceOnline: isOnline,
+      isFastingDay: isFasting,
     });
 
     return addCorsHeaders(response);
