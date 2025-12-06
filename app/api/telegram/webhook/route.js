@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getDatabase } from '@/lib/services/firebase.js';
-import { sendTelegramMessage, formatDate } from '@/lib/services/telegram.js';
+import { formatDate } from '@/lib/services/telegram.js';
 import { addCorsHeaders, handleCORS } from '@/lib/utils/cors.js';
 
 export const runtime = 'nodejs';
@@ -40,8 +40,9 @@ function fieldsToDate(fields) {
 
 /**
  * Send a Telegram message (simple version without message limit management).
+ * Used for command responses in webhook.
  */
-async function sendTelegramMessage(message) {
+async function sendSimpleTelegramMessage(message) {
   try {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
@@ -315,7 +316,7 @@ export async function POST(request) {
       db = getDatabase();
     } catch (error) {
       console.error('[TELEGRAM] Firebase initialization failed:', error);
-      await sendTelegramMessage('❌ Error: Failed to initialize database.');
+      await sendSimpleTelegramMessage('❌ Error: Failed to initialize database.');
       const response = NextResponse.json({ ok: true });
       return addCorsHeaders(response);
     }
@@ -345,7 +346,7 @@ export async function POST(request) {
     }
 
     if (responseMessage) {
-      await sendTelegramMessage(responseMessage);
+      await sendSimpleTelegramMessage(responseMessage);
     }
 
     const response = NextResponse.json({ ok: true });
