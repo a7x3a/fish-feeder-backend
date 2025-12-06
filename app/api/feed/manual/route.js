@@ -8,8 +8,9 @@ export const dynamic = 'force-dynamic';
 
 /**
  * Firebase timeout wrapper
+ * Increased timeouts for better reliability
  */
-async function withTimeout(promise, ms = 5000) {
+async function withTimeout(promise, ms = 8000) {
   return Promise.race([
     promise,
     new Promise((_, reject) =>
@@ -64,18 +65,26 @@ export async function POST(request) {
     const deviceRef = db.ref('system/device');
 
     // Load data with timeout protection
+    // Read feeder first (critical), then device (can be slower)
     let feederData, deviceData;
     try {
-      const [feederSnapshot, deviceSnapshot] = await withTimeout(
-        Promise.all([
-          feederRef.once('value'),
-          deviceRef.once('value'),
-        ]),
-        5000
+      const feederSnapshot = await withTimeout(
+        feederRef.once('value'),
+        8000 // 8 second timeout
       );
-
       feederData = feederSnapshot.val() || {};
-      deviceData = deviceSnapshot.val() || {};
+
+      // Read device data (can fail without breaking feed)
+      try {
+        const deviceSnapshot = await withTimeout(
+          deviceRef.once('value'),
+          6000 // 6 second timeout
+        );
+        deviceData = deviceSnapshot.val() || {};
+      } catch (deviceError) {
+        console.warn('[FEED] Device read failed, using defaults:', deviceError.message);
+        deviceData = {};
+      }
     } catch (error) {
       if (error.message === 'firebase_timeout') {
         return addCorsHeaders(NextResponse.json({
@@ -176,7 +185,7 @@ export async function POST(request) {
           feederRef,
           now,
         }),
-        5000
+        10000 // 10 second timeout for critical feed operation
       );
       timestampMs = result.timestampMs;
     } catch (error) {

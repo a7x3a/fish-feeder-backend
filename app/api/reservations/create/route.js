@@ -8,8 +8,9 @@ export const dynamic = 'force-dynamic';
 
 /**
  * Firebase timeout wrapper
+ * Increased timeouts for better reliability
  */
-async function withTimeout(promise, ms = 5000) {
+async function withTimeout(promise, ms = 8000) {
   return Promise.race([
     promise,
     new Promise((_, reject) =>
@@ -67,7 +68,7 @@ export async function POST(request) {
     try {
       const feederSnapshot = await withTimeout(
         feederRef.once('value'),
-        5000
+        8000 // 8 second timeout
       );
       feederData = feederSnapshot.val() || {};
     } catch (error) {
@@ -181,7 +182,7 @@ export async function POST(request) {
     try {
       await withTimeout(
         feederRef.child('reservations').set(updatedReservations),
-        5000
+        8000 // 8 second timeout
       );
     } catch (error) {
       if (error.message === 'firebase_timeout') {

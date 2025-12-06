@@ -9,8 +9,9 @@ export const dynamic = 'force-dynamic';
 
 /**
  * Firebase timeout wrapper - prevents hanging operations
+ * Increased timeouts for better reliability
  */
-async function withTimeout(promise, ms = 3000) {
+async function withTimeout(promise, ms = 8000) {
   return Promise.race([
     promise,
     new Promise((_, reject) =>
@@ -84,18 +85,28 @@ async function executeCron(request) {
     const deviceRef = db.ref('system/device');
 
     // Step 3: Load data with timeout protection
+    // Try to read only feeder data first (faster), then device if needed
     let feederData, deviceData;
     try {
-      const [feederSnapshot, deviceSnapshot] = await withTimeout(
-        Promise.all([
-          feederRef.once('value'),
-          deviceRef.once('value'),
-        ]),
-        4000 // 4 second timeout for reads (more realistic)
+      // Read feeder first (most important)
+      const feederSnapshot = await withTimeout(
+        feederRef.once('value'),
+        8000 // 8 second timeout for reads
       );
-
       feederData = feederSnapshot.val() || {};
-      deviceData = deviceSnapshot.val() || {};
+
+      // Read device data (can be slower, but we need it)
+      try {
+        const deviceSnapshot = await withTimeout(
+          deviceRef.once('value'),
+          6000 // 6 second timeout for device read
+        );
+        deviceData = deviceSnapshot.val() || {};
+      } catch (deviceError) {
+        // If device read fails, use empty object (non-critical for some checks)
+        console.warn('[CRON] Device read failed, using defaults:', deviceError.message);
+        deviceData = {};
+      }
     } catch (error) {
       if (error.message === 'firebase_timeout') {
         console.log('[CRON] firebase_timeout on read');
@@ -126,13 +137,23 @@ async function executeCron(request) {
     }
 
     // Step 5: Check device online (60 second threshold)
-    const lastSeen = deviceData.lastSeen;
-    if (!isDeviceOnlineFast(lastSeen, deviceData)) {
+    // If device data is missing, assume online (graceful degradation)
+    const lastSeen = deviceData?.lastSeen;
+    const isOnline = isDeviceOnlineFast(lastSeen, deviceData);
+    
+    if (!isOnline && lastSeen) {
+      // Only fail if we have lastSeen data and it's stale
+      // If device data read failed, give benefit of doubt
       console.log('[CRON] device_offline');
       return NextResponse.json({
         type: 'none',
         reason: 'device_offline'
       });
+    }
+    
+    // If device data is missing but feeder data exists, continue (device might be syncing)
+    if (!lastSeen && Object.keys(deviceData).length === 0) {
+      console.warn('[CRON] Device data missing, but continuing (graceful degradation)');
     }
 
     // Step 6: Check status before feeding (prevent conflicts)
@@ -201,7 +222,7 @@ async function executeCron(request) {
             feederRef,
             now,
           }),
-          5000 // 5 second timeout for feed trigger (3 writes needed)
+          10000 // 10 second timeout for feed trigger (critical operation)
         );
         timestampMs = result.timestampMs;
       } catch (error) {
@@ -238,18 +259,16 @@ async function executeCron(request) {
         currentScheduledTime = scheduledTime + cooldownMs;
       }
 
-      // Update reservations with timeout (non-critical - can fail)
-      withTimeout(
-        feederRef.child('reservations').set(recalculatedReservations),
-        3000
-      ).catch(error => {
-        if (error.message === 'firebase_timeout') {
-          console.log('[CRON] firebase_timeout on reservations update (non-critical)');
-        } else {
-          console.error('[CRON] Error updating reservations:', error);
-        }
-        // Continue anyway - feed was triggered successfully
-      });
+      // Update reservations with timeout (non-critical - fire and forget)
+      // Don't wait for this - feed was already triggered successfully
+      setTimeout(() => {
+        feederRef.child('reservations').set(recalculatedReservations)
+          .then(() => console.log('[CRON] Reservations updated'))
+          .catch(error => {
+            console.error('[CRON] Error updating reservations (non-critical):', error.message);
+            // Continue anyway - feed was triggered successfully
+          });
+      }, 0);
 
       // Send Telegram notification (non-blocking)
       sendReservationExecutedMessage({
@@ -295,7 +314,7 @@ async function executeCron(request) {
               feederRef,
               now,
             }),
-            5000 // 5 second timeout for feed trigger (3 writes needed)
+            10000 // 10 second timeout for feed trigger (critical operation)
           );
         } catch (error) {
           if (error.message === 'firebase_timeout') {
