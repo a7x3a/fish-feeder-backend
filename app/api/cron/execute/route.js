@@ -273,12 +273,15 @@ async function executeCron(request) {
           });
       }, 0);
 
-      // Send Telegram notification (non-blocking)
+      // Send Telegram notification (non-blocking but log if it fails)
       sendReservationExecutedMessage({
         user: reservationUser,
         now,
         db,
-      }).catch(err => console.error('[CRON] Telegram failed:', err));
+      }).catch(err => {
+        console.error('[CRON] Telegram notification failed:', err.message);
+        console.error('[CRON] Telegram error details:', err);
+      });
 
       const elapsed = Date.now() - startTime;
       console.log(`[CRON] reservation_executed in ${elapsed}ms`);
@@ -291,7 +294,11 @@ async function executeCron(request) {
 
     // Step 11: Auto feed (Priority 2 - only if no reservations)
     if (validReservations.length === 0) {
-      const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
+      // FIX: Use nullish coalescing (??) instead of || to allow 0 value
+      // If autoFeedDelayMinutes is 0, it should trigger immediately after cooldown
+      const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes !== undefined 
+        ? feederData.priority.autoFeedDelayMinutes 
+        : 30;
       const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
       
       // Calculate when auto feed should trigger
@@ -304,6 +311,7 @@ async function executeCron(request) {
       
       const autoFeedTime = cooldownEndTime + autoFeedDelayMs;
 
+      // If autoFeedDelayMinutes is 0, trigger immediately after cooldown
       if (Date.now() >= autoFeedTime) {
         const now = new Date();
 
@@ -330,8 +338,11 @@ async function executeCron(request) {
           throw error;
         }
 
-        // Send Telegram notification (non-blocking)
-        sendAutoFeedMessage({ now, db }).catch(err => console.error('[CRON] Telegram failed:', err));
+        // Send Telegram notification (non-blocking but log if it fails)
+        sendAutoFeedMessage({ now, db }).catch(err => {
+          console.error('[CRON] Telegram notification failed:', err.message);
+          console.error('[CRON] Telegram error details:', err);
+        });
 
         const elapsed = Date.now() - startTime;
         console.log(`[CRON] auto_feed_executed in ${elapsed}ms`);
@@ -356,7 +367,11 @@ async function executeCron(request) {
     const readyCount = readyReservations.length;
     const cooldownEndsAt = lastFeedTime + cooldownMs;
     const cooldownRemaining = Math.max(0, cooldownEndsAt - Date.now());
-    const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
+    
+    // FIX: Use nullish coalescing (??) instead of || to allow 0 value
+    const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes !== undefined 
+      ? feederData.priority.autoFeedDelayMinutes 
+      : 30;
     const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
     const autoFeedTime = cooldownEndsAt + autoFeedDelayMs;
     const autoFeedRemaining = Math.max(0, autoFeedTime - Date.now());
