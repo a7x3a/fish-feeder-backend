@@ -163,10 +163,6 @@ async function handleStatusCommand(db) {
     const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes || 30;
     const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
 
-    const nextFeedTime = lastFeedTime
-      ? new Date(lastFeedTime.getTime() + cooldownMs + autoFeedDelayMs)
-      : null;
-
     const cooldownHours = Math.floor(cooldownMs / 3600000);
     const cooldownMins = Math.floor((cooldownMs % 3600000) / 60000);
     const cooldownStr = `${cooldownHours}:${cooldownMins.toString().padStart(2, '0')}`;
