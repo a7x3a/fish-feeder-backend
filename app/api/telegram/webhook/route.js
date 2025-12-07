@@ -174,22 +174,67 @@ async function handleStatusCommand(db) {
     const reservations = feederData.reservations || [];
     const validReservations = reservations.filter((r) => r && r.scheduledTime);
 
+    // Calculate next feed time
+    const now = Date.now();
+    let nextFeedTime = null;
+    let nextFeedType = 'Auto Feed';
+    
+    if (validReservations.length > 0) {
+      const nextReservation = validReservations
+        .map(r => ({
+          ...r,
+          scheduledTime: typeof r.scheduledTime === 'number' ? r.scheduledTime : parseInt(r.scheduledTime, 10)
+        }))
+        .sort((a, b) => a.scheduledTime - b.scheduledTime)[0];
+      nextFeedTime = new Date(nextReservation.scheduledTime);
+      nextFeedType = `Reservation (${nextReservation.user || 'Unknown'})`;
+    } else if (lastFeedTime) {
+      const cooldownEndTime = lastFeedTime.getTime() + cooldownMs;
+      nextFeedTime = new Date(cooldownEndTime + autoFeedDelayMs);
+    }
+    
+    // Calculate time remaining
+    const remainingMs = nextFeedTime ? Math.max(0, nextFeedTime.getTime() - now) : 0;
+    const remainingHours = Math.floor(remainingMs / 3600000);
+    const remainingMinutes = Math.floor((remainingMs % 3600000) / 60000);
+    let timeRemaining = 'Ready now';
+    if (remainingMs > 0) {
+      if (remainingHours > 0) {
+        timeRemaining = `${remainingHours}h ${remainingMinutes}m`;
+      } else {
+        timeRemaining = `${remainingMinutes}m`;
+      }
+    }
+    
+    // Format uptime
+    const uptimeHours = Math.floor(uptime / 3600);
+    const uptimeMins = Math.floor((uptime % 3600) / 60);
+    const uptimeStr = uptimeHours > 0 
+      ? `${uptimeHours}h ${uptimeMins}m`
+      : `${uptimeMins}m`;
+
     const message = [
       '📊 <b>SYSTEM STATUS</b>',
       '',
-      `<b>Device:</b> ${deviceStatus}`,
-      `<b>WiFi:</b> ${wifiStatus}`,
-      `<b>Servo:</b> ${servoStatus}`,
-      `<b>Uptime:</b> ${uptime} seconds`,
+      '<b>🔌 Device Status:</b>',
+      `   ${isOnline ? '🟢' : '🔴'} <b>Status:</b> <code>${deviceStatus.toUpperCase()}</code>`,
+      `   📶 <b>WiFi:</b> <code>${wifiStatus}</code>`,
+      `   ⚙️ <b>Servo:</b> <code>${servoStatus}</code>`,
+      `   ⏱️ <b>Uptime:</b> <code>${uptimeStr}</code>`,
       '',
-      `<b>Last Feed:</b> ${formatDate(lastFeedTime)}`,
-      `<b>Next Feed:</b> ${formatDate(nextFeedTime)}`,
-      `<b>Cooldown:</b> ${cooldownStr}`,
+      '<b>🍽️ Feed Status:</b>',
+      `   🕐 <b>Last Feed:</b> <code>${formatDate(lastFeedTime)}</code>`,
+      `   ⏰ <b>Next Feed:</b> <code>${formatDate(nextFeedTime)}</code>`,
+      `   🔧 <b>Type:</b> <code>${nextFeedType}</code>`,
+      `   ⏳ <b>Time Remaining:</b> <code>${timeRemaining}</code>`,
+      `   ⏱️ <b>Cooldown:</b> <code>${cooldownStr}</code>`,
       '',
-      `<b>Temperature:</b> ${sensors.temperature || 'N/A'}°C`,
-      `<b>TDS:</b> ${sensors.tds || 'N/A'} ppm`,
+      '<b>🌡️ Sensors:</b>',
+      `   🌡️ <b>Temperature:</b> <code>${sensors.temperature || 'N/A'}°C</code>`,
+      `   💧 <b>TDS:</b> <code>${sensors.tds || 'N/A'} ppm</code>`,
       '',
-      `<b>Reservations:</b> ${validReservations.length}`,
+      '<b>📌 Reservations:</b>',
+      `   📋 <b>Count:</b> <code>${validReservations.length}</code>`,
     ].join('\n');
 
     return message;
@@ -247,10 +292,22 @@ async function handleReservationsCommand(db) {
     const validReservations = reservations.filter((r) => r && r.scheduledTime);
 
     if (validReservations.length === 0) {
-      return '📌 <b>ACTIVE RESERVATIONS</b>\n\nNo active reservations.';
+      return [
+        '📌 <b>ACTIVE RESERVATIONS</b>',
+        '',
+        'No active reservations in queue.',
+        '',
+        '💡 Use the frontend to create a reservation.',
+      ].join('\n');
     }
 
-    const lines = ['📌 <b>ACTIVE RESERVATIONS</b>', ''];
+    const now = Date.now();
+    const lines = [
+      '📌 <b>ACTIVE RESERVATIONS</b>',
+      '',
+      `Total: <code>${validReservations.length}</code> reservation(s)`,
+      '',
+    ];
 
     validReservations.forEach((reservation, index) => {
       const scheduledTime = typeof reservation.scheduledTime === 'number' 
@@ -259,7 +316,27 @@ async function handleReservationsCommand(db) {
       const scheduledDate = scheduledTime ? new Date(scheduledTime) : null;
       const timeStr = formatDate(scheduledDate);
       const user = reservation.user || 'unknown';
-      lines.push(`${index + 1}. ${user} – ${timeStr}`);
+      
+      // Calculate time remaining
+      const remainingMs = Math.max(0, scheduledTime - now);
+      const remainingHours = Math.floor(remainingMs / 3600000);
+      const remainingMinutes = Math.floor((remainingMs % 3600000) / 60000);
+      
+      let timeLeft = '⏰ Ready now';
+      if (remainingMs > 0) {
+        if (remainingHours > 0) {
+          timeLeft = `⏳ ${remainingHours}h ${remainingMinutes}m`;
+        } else {
+          timeLeft = `⏳ ${remainingMinutes}m`;
+        }
+      }
+      
+      lines.push(
+        `${index + 1}. <b>${user}</b>`,
+        `   🕐 ${timeStr}`,
+        `   ${timeLeft}`,
+        ''
+      );
     });
 
     return lines.join('\n');
@@ -270,16 +347,157 @@ async function handleReservationsCommand(db) {
 }
 
 /**
+ * Handle /nextfeed command - show when next feed will happen
+ */
+async function handleNextFeedCommand(db) {
+  try {
+    const feederRef = db.ref('system/feeder');
+    const feederSnapshot = await feederRef.once('value');
+    const feederData = feederSnapshot.val() || {};
+    
+    const lastFeedTime = feederData.lastFeedTime || 0;
+    const timerHour = feederData.timer?.hour || 0;
+    const timerMinute = feederData.timer?.minute || 0;
+    const cooldownMs = timerHour * 3600000 + timerMinute * 60000;
+    const autoFeedDelayMinutes = feederData.priority?.autoFeedDelayMinutes !== undefined 
+      ? feederData.priority.autoFeedDelayMinutes 
+      : 30;
+    const autoFeedDelayMs = autoFeedDelayMinutes * 60000;
+    
+    const reservations = feederData.reservations || [];
+    const validReservations = reservations.filter((r) => r && r.scheduledTime);
+    
+    const now = Date.now();
+    let nextFeedTime = null;
+    let nextFeedType = 'Auto Feed';
+    
+    // Check if there's a reservation ready or upcoming
+    if (validReservations.length > 0) {
+      const nextReservation = validReservations
+        .map(r => ({
+          ...r,
+          scheduledTime: typeof r.scheduledTime === 'number' ? r.scheduledTime : parseInt(r.scheduledTime, 10)
+        }))
+        .sort((a, b) => a.scheduledTime - b.scheduledTime)[0];
+      
+      nextFeedTime = nextReservation.scheduledTime;
+      nextFeedType = `Reservation (${nextReservation.user || 'Unknown'})`;
+    } else {
+      // Calculate auto feed time
+      if (lastFeedTime > 0) {
+        const cooldownEndTime = lastFeedTime + cooldownMs;
+        nextFeedTime = cooldownEndTime + autoFeedDelayMs;
+      } else {
+        nextFeedTime = now;
+      }
+    }
+    
+    const remainingMs = Math.max(0, nextFeedTime - now);
+    const remainingHours = Math.floor(remainingMs / 3600000);
+    const remainingMinutes = Math.floor((remainingMs % 3600000) / 60000);
+    const remainingSeconds = Math.floor((remainingMs % 60000) / 1000);
+    
+    let timeRemaining = 'Ready now';
+    if (remainingMs > 0) {
+      if (remainingHours > 0) {
+        timeRemaining = `${remainingHours}h ${remainingMinutes}m`;
+      } else if (remainingMinutes > 0) {
+        timeRemaining = `${remainingMinutes}m ${remainingSeconds}s`;
+      } else {
+        timeRemaining = `${remainingSeconds}s`;
+      }
+    }
+    
+    const nextFeedDate = nextFeedTime ? new Date(nextFeedTime) : null;
+    
+    return [
+      '⏰ <b>NEXT FEED</b>',
+      '',
+      `🔧 <b>Type:</b> <code>${nextFeedType}</code>`,
+      `🕐 <b>Scheduled:</b> <code>${formatDate(nextFeedDate)}</code>`,
+      `⏳ <b>Time Remaining:</b> <code>${timeRemaining}</code>`,
+      '',
+      validReservations.length > 0 
+        ? `📌 <b>Reservations:</b> <code>${validReservations.length}</code> in queue`
+        : '🤖 Auto feed will trigger after cooldown + delay',
+    ].join('\n');
+  } catch (error) {
+    console.error('[TELEGRAM] Error handling /nextfeed:', error);
+    return '❌ Error: Failed to get next feed time.';
+  }
+}
+
+/**
+ * Handle /cooldown command - show cooldown status
+ */
+async function handleCooldownCommand(db) {
+  try {
+    const feederRef = db.ref('system/feeder');
+    const feederSnapshot = await feederRef.once('value');
+    const feederData = feederSnapshot.val() || {};
+    
+    const lastFeedTime = feederData.lastFeedTime || 0;
+    const timerHour = feederData.timer?.hour || 0;
+    const timerMinute = feederData.timer?.minute || 0;
+    const cooldownMs = timerHour * 3600000 + timerMinute * 60000;
+    
+    const now = Date.now();
+    const cooldownEndsAt = lastFeedTime + cooldownMs;
+    const remainingMs = Math.max(0, cooldownEndsAt - now);
+    
+    const cooldownHours = Math.floor(cooldownMs / 3600000);
+    const cooldownMins = Math.floor((cooldownMs % 3600000) / 60000);
+    const cooldownStr = `${cooldownHours}:${cooldownMins.toString().padStart(2, '0')}`;
+    
+    const remainingHours = Math.floor(remainingMs / 3600000);
+    const remainingMinutes = Math.floor((remainingMs % 3600000) / 60000);
+    const remainingSeconds = Math.floor((remainingMs % 60000) / 1000);
+    
+    let remainingStr = '✅ Cooldown finished';
+    if (remainingMs > 0) {
+      if (remainingHours > 0) {
+        remainingStr = `${remainingHours}h ${remainingMinutes}m ${remainingSeconds}s`;
+      } else if (remainingMinutes > 0) {
+        remainingStr = `${remainingMinutes}m ${remainingSeconds}s`;
+      } else {
+        remainingStr = `${remainingSeconds}s`;
+      }
+    }
+    
+    return [
+      '⏳ <b>COOLDOWN STATUS</b>',
+      '',
+      `⏱️ <b>Cooldown Period:</b> <code>${cooldownStr}</code>`,
+      `⏰ <b>Last Feed:</b> <code>${formatDate(lastFeedTime ? new Date(lastFeedTime) : null)}</code>`,
+      `🕐 <b>Cooldown Ends:</b> <code>${formatDate(new Date(cooldownEndsAt))}</code>`,
+      '',
+      remainingMs > 0 
+        ? `⏳ <b>Time Remaining:</b> <code>${remainingStr}</code>`
+        : `✅ <b>Status:</b> <code>${remainingStr}</code>`,
+    ].join('\n');
+  } catch (error) {
+    console.error('[TELEGRAM] Error handling /cooldown:', error);
+    return '❌ Error: Failed to get cooldown status.';
+  }
+}
+
+/**
  * Handle /help command.
  */
 function handleHelpCommand() {
   return [
-    '<b>FishFeeder Bot Commands:</b>',
-    '/status – Show full system status',
-    '/history – Last 5 feed events',
-    '/reservations – Active reservation queue',
-    '/clear – Clear all bot messages',
-    '/help – Available commands',
+    '🤖 <b>FishFeeder Bot Commands</b>',
+    '',
+    '📊 <b>Information:</b>',
+    '  /status – Full system status',
+    '  /nextfeed – When next feed will happen',
+    '  /cooldown – Cooldown status and time remaining',
+    '  /reservations – Active reservation queue with time left',
+    '  /history – Last 5 feed events',
+    '',
+    '🔧 <b>Actions:</b>',
+    '  /clear – Clear all bot messages',
+    '  /help – Show this help message',
   ].join('\n');
 }
 
@@ -326,11 +544,15 @@ export async function POST(request) {
     // Handle commands
     if (messageText === '/status') {
       responseMessage = await handleStatusCommand(db);
+    } else if (messageText === '/nextfeed' || messageText === '/next') {
+      responseMessage = await handleNextFeedCommand(db);
+    } else if (messageText === '/cooldown') {
+      responseMessage = await handleCooldownCommand(db);
     } else if (messageText === '/history') {
       responseMessage = await handleHistoryCommand(db);
-    } else if (messageText === '/reservations') {
+    } else if (messageText === '/reservations' || messageText === '/res') {
       responseMessage = await handleReservationsCommand(db);
-    } else if (messageText === '/help') {
+    } else if (messageText === '/help' || messageText === '/start') {
       responseMessage = handleHelpCommand();
     } else if (messageText === '/clear') {
       const result = await clearAllTelegramMessages(db);
@@ -340,9 +562,8 @@ export async function POST(request) {
         responseMessage = `❌ Error: ${result.error}`;
       }
     } else {
-      // Unknown command - ignore
-      const response = NextResponse.json({ ok: true });
-      return addCorsHeaders(response);
+      // Unknown command - show help
+      responseMessage = '❓ Unknown command. Use /help to see available commands.';
     }
 
     if (responseMessage) {

@@ -199,13 +199,19 @@ export async function POST(request) {
       throw error;
     }
 
-    // Send Telegram notification (non-blocking)
-    sendFeedExecutedMessage({
-      type: 'manual',
-      user: user || userEmail || 'Visitor',
-      now,
-      db,
-    }).catch(err => console.error('[FEED] Telegram notification failed:', err.message));
+    // Send Telegram notification (await to ensure it's sent)
+    try {
+      await sendFeedExecutedMessage({
+        type: 'manual',
+        user: user || userEmail || 'Visitor',
+        now,
+        db,
+      });
+      console.log('[FEED] Manual feed Telegram notification sent');
+    } catch (err) {
+      console.error('[FEED] Telegram notification failed:', err.message);
+      // Don't fail the feed if Telegram fails
+    }
 
     const elapsed = Date.now() - startTime;
     console.log(`[FEED] Manual feed executed in ${elapsed}ms`);
