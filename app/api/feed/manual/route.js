@@ -200,16 +200,26 @@ export async function POST(request) {
     }
 
     // Send Telegram notification (await to ensure it's sent)
+    let telegramStatus = { success: false, error: 'NOT_SENT' };
     try {
-      await sendFeedExecutedMessage({
+      console.log('[FEED] Sending Telegram notification for manual feed...');
+      const telegramResult = await sendFeedExecutedMessage({
         type: 'manual',
         user: user || userEmail || 'Visitor',
         now,
         db,
       });
-      console.log('[FEED] Manual feed Telegram notification sent');
+      
+      if (telegramResult?.success) {
+        telegramStatus = { success: true, messageId: telegramResult.messageId };
+        console.log('[FEED] ✅ Manual feed Telegram notification sent successfully');
+      } else {
+        telegramStatus = { success: false, error: telegramResult?.error || 'UNKNOWN_ERROR' };
+        console.warn('[FEED] ⚠️ Telegram notification failed:', telegramResult?.error);
+      }
     } catch (err) {
-      console.error('[FEED] Telegram notification failed:', err.message);
+      telegramStatus = { success: false, error: err.message || 'EXCEPTION' };
+      console.error('[FEED] ❌ Telegram notification exception:', err.message);
       // Don't fail the feed if Telegram fails
     }
 
@@ -222,6 +232,7 @@ export async function POST(request) {
       feedTime: timestampMs,
       type: 'manual',
       user: user || userEmail || 'Visitor',
+      telegram: telegramStatus, // Include Telegram status in response
     }));
 
   } catch (error) {
