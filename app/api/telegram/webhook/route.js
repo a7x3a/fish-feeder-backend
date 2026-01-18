@@ -517,13 +517,7 @@ export async function POST(request) {
     const messageText = body.message.text.trim();
     const chatId = body.message.chat.id;
 
-    // Verify chat ID matches configured chat ID
-    const configuredChatId = process.env.TELEGRAM_CHAT_ID;
-    if (String(chatId) !== String(configuredChatId)) {
-      console.warn(`[TELEGRAM] Received message from unauthorized chat: ${chatId}`);
-      const response = NextResponse.json({ ok: true });
-      return addCorsHeaders(response);
-    }
+  
 
     let db;
     try {
